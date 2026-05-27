@@ -1,0 +1,452 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>재고 분석 앱</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Inventory Analytics</p>
+          <h1>재고 분석 앱</h1>
+        </div>
+        <div class="topbar-actions">
+          <button id="reloadButton" type="button">새로고침</button>
+          <span id="loadStatus" class="load-status">대기 중</span>
+        </div>
+      </header>
+
+      <section class="control-band">
+        <label>
+          <span>분석 대상</span>
+          <select id="datasetFilter">
+            <option value="all">전체</option>
+            <option value="vending">자판기 상품</option>
+            <option value="consumable" selected>경상소모품</option>
+          </select>
+        </label>
+        <label>
+          <span>지점</span>
+          <select id="branchFilter"></select>
+        </label>
+        <label>
+          <span>분석 시작월</span>
+          <input id="historyStart" type="month" />
+        </label>
+        <label>
+          <span>분석 종료월</span>
+          <input id="historyEnd" type="month" />
+        </label>
+        <label>
+          <span id="safetyLabel">안전재고</span>
+          <input id="safetyMonths" type="number" min="1" step="1" value="2" />
+        </label>
+        <label id="deliveryWeeksField" class="hidden">
+          <span>배송 주기(주)</span>
+          <input id="deliveryWeeks" type="number" min="1" step="1" value="2" />
+        </label>
+        <label class="search-box">
+          <span>검색</span>
+          <input id="searchInput" type="search" placeholder="품번, 품명, 규격" />
+        </label>
+      </section>
+
+      <section class="metric-grid" aria-label="요약 지표">
+        <article class="metric-card">
+          <span>현재고 수량</span>
+          <strong id="totalStockQty">0</strong>
+        </article>
+        <article class="metric-card">
+          <span id="consumeMetricLabel">월 소모/판매 수량</span>
+          <strong id="totalConsumeQty">0</strong>
+        </article>
+        <article class="metric-card">
+          <span id="consumeAmountMetricLabel">월 소모 금액</span>
+          <strong id="totalConsumeAmount">0원</strong>
+        </article>
+        <article class="metric-card warning">
+          <span id="purchaseMetricLabel">구매 추천 금액</span>
+          <strong id="totalPurchaseAmount">0원</strong>
+        </article>
+      </section>
+
+      <section id="vendingBranchFilters" class="branch-filter-panel hidden" aria-label="지점별 보기">
+        <div class="branch-filter-heading">
+          <div>
+            <h2 id="branchFilterTitle">지점별 보기</h2>
+            <p id="branchFilterDescription">지점을 선택하면 아래 현황과 구매필요 계획이 해당 지점 기준으로 표시됩니다.</p>
+          </div>
+        </div>
+        <div id="vendingBranchButtons" class="branch-card-grid"></div>
+      </section>
+
+      <nav class="tabs" aria-label="분석 메뉴">
+        <button id="overviewTab" class="tab active" data-tab="overview" type="button">현황</button>
+        <button id="discardTab" class="tab hidden" data-tab="discard" type="button">폐기</button>
+        <button id="otherTab" class="tab hidden" data-tab="other" type="button">기타</button>
+        <button id="deliveryTab" class="tab hidden" data-tab="delivery" type="button">배송</button>
+        <button id="purchaseTab" class="tab" data-tab="purchase" type="button">구매 추천</button>
+        <button id="purposeTab" class="tab" data-tab="purpose" type="button">용도별 소모</button>
+        <button class="tab" data-tab="amount" type="button">금액 분석</button>
+        <button class="tab" data-tab="exceptions" type="button">확인 필요</button>
+      </nav>
+
+      <section id="overview" class="tab-page active">
+        <article id="vendingSalesMonthPanel" class="panel hidden">
+          <div class="panel-title">
+            <div>
+              <h2>월별 총 매출</h2>
+              <p>월별 매출 흐름을 먼저 보고, 점을 클릭하면 해당 월 판매 세부내역이 표시됩니다.</p>
+            </div>
+          </div>
+          <div id="vendingSalesMonthChart" class="discard-line-chart"></div>
+        </article>
+
+        <article id="vendingSalesBranchPanel" class="panel hidden">
+          <div class="panel-title">
+            <div>
+              <h2>지점별 월 매출</h2>
+              <p>월을 클릭하면 지점별 매출 비율과 금액이 원그래프로 표시됩니다.</p>
+            </div>
+            <button id="clearSalesSelection" type="button">전체 보기</button>
+          </div>
+          <div id="vendingSalesBranchChart" class="discard-heatmap"></div>
+        </article>
+
+        <div id="overviewSummaryPanels" class="split-layout">
+          <article class="panel">
+            <div class="panel-title">
+              <h2 id="branchAmountTitle">지점별 당월 소모 금액</h2>
+            </div>
+            <div id="branchAmountList" class="bar-list"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-title">
+              <h2 id="topConsumeTitle">소모/판매 상위 품목</h2>
+            </div>
+            <div id="topConsumeList" class="rank-list"></div>
+          </article>
+        </div>
+
+        <article class="panel table-panel">
+          <div class="panel-title">
+            <h2 id="overviewTitle">현재고 현황</h2>
+            <span id="overviewCount" class="panel-count">0건</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr id="overviewHeaderRow">
+                  <th>구분</th>
+                  <th>지점</th>
+                  <th>품번</th>
+                  <th>품명</th>
+                  <th>규격</th>
+                  <th>단위</th>
+                  <th class="number">현재고</th>
+                  <th id="overviewConsumeHeader" class="number">월 소모</th>
+                  <th id="overviewDiscardHeader" class="number">이동</th>
+                  <th id="overviewOtherHeader" class="number hidden">평균 기타</th>
+                  <th id="overviewPriceHeader" class="number">단가</th>
+                  <th id="overviewSalePriceHeader" class="number hidden">판매단가</th>
+                  <th id="overviewAmountHeader" class="number">소모 금액</th>
+                </tr>
+              </thead>
+              <tbody id="overviewBody"></tbody>
+            </table>
+          </div>
+        </article>
+
+      </section>
+
+      <section id="discard" class="tab-page">
+        <article class="panel">
+          <div class="panel-title">
+            <div>
+              <h2>월별 총 폐기금액</h2>
+              <p>월별 폐기 흐름을 먼저 보고, 점을 클릭하면 해당 월 세부내역이 표시됩니다.</p>
+            </div>
+          </div>
+          <div id="vendingDiscardMonthChart" class="discard-line-chart"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-title">
+            <div>
+              <h2>지점별 월 폐기금액</h2>
+              <p>월 또는 지점별 셀을 클릭하면 아래 세부내역이 해당 조건으로 바뀝니다.</p>
+            </div>
+            <button id="clearDiscardSelection" type="button">전체 보기</button>
+          </div>
+          <div id="vendingDiscardChart" class="discard-heatmap"></div>
+        </article>
+
+        <article class="panel table-panel">
+          <div class="panel-title">
+            <div>
+              <h2 id="vendingDiscardDetailTitle">자판기 폐기 세부내역</h2>
+              <p id="vendingDiscardBasis">선택한 분석 기간의 평균 폐기와 당월 폐기를 따로 확인합니다.</p>
+            </div>
+            <span id="vendingDiscardCount" class="panel-count">0건</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr id="vendingDiscardHeaderRow">
+                  <th>구분</th>
+                  <th>지점</th>
+                  <th>품번</th>
+                  <th>품명</th>
+                  <th>규격</th>
+                  <th>단위</th>
+                  <th class="number">현재고</th>
+                  <th class="number">폐기 합계</th>
+                  <th class="number">구매단가</th>
+                  <th class="number">폐기 금액</th>
+                </tr>
+              </thead>
+              <tbody id="vendingDiscardBody"></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
+      <section id="other" class="tab-page">
+        <article id="vendingOtherMonthPanel" class="panel">
+          <div class="panel-title">
+            <div>
+              <h2>월별 기타 수량</h2>
+              <p>월별 기타 입력 흐름을 먼저 보고, 점을 클릭하면 해당 월 세부내역이 표시됩니다.</p>
+            </div>
+          </div>
+          <div id="vendingOtherMonthChart" class="discard-line-chart"></div>
+        </article>
+
+        <article id="vendingOtherBranchPanel" class="panel">
+          <div class="panel-title">
+            <div>
+              <h2>지점별 월 기타 수량</h2>
+              <p>월을 클릭하면 지점별 기타 수량 비율과 수량이 원그래프로 표시됩니다.</p>
+            </div>
+            <button id="clearOtherSelection" type="button">전체 보기</button>
+          </div>
+          <div id="vendingOtherBranchChart" class="discard-heatmap"></div>
+        </article>
+
+        <article id="vendingOtherPanel" class="panel table-panel hidden">
+          <div class="panel-title">
+            <div>
+              <h2 id="vendingOtherTitle">백업 이력 기타 현황</h2>
+              <p id="vendingOtherBasis">선택한 분석 기간의 원본 시트 기타 입력 수량입니다.</p>
+            </div>
+            <span id="vendingOtherCount" class="panel-count">0개</span>
+          </div>
+          <div class="table-wrap compact">
+            <table>
+              <thead>
+                <tr>
+                  <th>지점</th>
+                  <th>품번</th>
+                  <th>품명</th>
+                  <th>규격</th>
+                  <th>단위</th>
+                  <th class="number">입력 월수</th>
+                  <th id="vendingOtherTotalHeader" class="number">기타 합계</th>
+                  <th class="number">구매단가</th>
+                  <th class="number">기타 금액</th>
+                  <th class="number">월평균 기타</th>
+                  <th>메모</th>
+                  <th>메모 작성</th>
+                </tr>
+              </thead>
+              <tbody id="vendingOtherBody"></tbody>
+            </table>
+          </div>
+        </article>
+
+        <article id="otherMemoPanel" class="panel memo-panel hidden">
+          <div class="panel-title">
+            <div>
+              <h2>기타 원인 메모</h2>
+              <p id="otherMemoTarget">품목을 선택하면 원인을 기록할 수 있습니다.</p>
+              <p id="otherMemoSyncStatus" class="memo-sync-status">현재 이 브라우저에만 메모가 저장됩니다.</p>
+            </div>
+          </div>
+          <div class="memo-editor">
+            <textarea id="otherMemoInput" rows="4" placeholder="예: 유통기한 임박으로 직원 제공, 테스트 출고, 재고 조정 등"></textarea>
+            <div class="memo-actions">
+              <button id="saveOtherMemo" type="button">메모 저장</button>
+              <button id="deleteOtherMemo" type="button">메모 삭제</button>
+              <button id="closeOtherMemo" type="button">닫기</button>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <section id="delivery" class="tab-page">
+        <article class="panel table-panel">
+          <div class="panel-title">
+            <div>
+              <h2 id="deliveryTitle">현재 판매 기준 배송 계획</h2>
+              <p id="deliveryBasis">현재 판매량과 지점 현재고를 기준으로 배송 필요 수량을 계산합니다.</p>
+            </div>
+            <button id="exportDelivery" type="button">CSV 저장</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>구분</th>
+                  <th>지점</th>
+                  <th>품번</th>
+                  <th>품명</th>
+                  <th>규격</th>
+                  <th>단위</th>
+                  <th class="number">현재고</th>
+                  <th class="number">당월 판매</th>
+                  <th class="number">배송주기 목표재고</th>
+                  <th class="number">배송 필요</th>
+                  <th class="number">단가</th>
+                  <th class="number">예상 금액</th>
+                </tr>
+              </thead>
+              <tbody id="deliveryBody"></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
+      <section id="purchase" class="tab-page">
+        <article class="panel table-panel">
+          <div class="panel-title">
+            <div>
+              <h2 id="purchaseTitle">2개월 안전재고 기준 구매 추천</h2>
+              <p id="purchaseBasis">기준 데이터를 불러오는 중입니다.</p>
+            </div>
+            <button id="exportPurchase" type="button">CSV 저장</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>구분</th>
+                  <th id="purchaseBranchHeader">지점</th>
+                  <th>품번</th>
+                  <th>품명</th>
+                  <th>규격</th>
+                  <th>단위</th>
+                  <th class="number">현재고</th>
+                  <th id="purchaseConsumeHeader" class="number">당월 소모</th>
+                  <th id="purchasePlanningHeader" class="number">추천 기준 월평균</th>
+                  <th id="purchaseDiscardHeader" class="number hidden">평균 폐기</th>
+                  <th>계산 기준</th>
+                  <th id="purchaseTargetHeader" class="number">권장 보유</th>
+                  <th id="purchaseQtyHeader" class="number">구매 추천</th>
+                  <th class="number">단가</th>
+                  <th class="number">예상 금액</th>
+                </tr>
+              </thead>
+              <tbody id="purchaseBody"></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
+      <section id="amount" class="tab-page">
+        <div class="split-layout">
+          <article class="panel">
+            <div class="panel-title">
+              <h2 id="categoryAmountTitle">카테고리별 소모 금액</h2>
+            </div>
+            <div id="categoryAmountList" class="bar-list"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-title">
+              <h2 id="discardAmountTitle">이동 금액 상위</h2>
+            </div>
+            <div id="discardAmountList" class="rank-list"></div>
+          </article>
+        </div>
+      </section>
+
+      <section id="purpose" class="tab-page">
+        <div class="split-layout">
+          <article class="panel">
+            <div class="panel-title">
+              <h2>용도별 당월 소모 금액</h2>
+            </div>
+            <div id="purposeCurrentAmountList" class="bar-list"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-title">
+              <h2 id="purposeAverageTitle">용도별 평균 월금액</h2>
+            </div>
+            <div id="purposeAverageAmountList" class="bar-list"></div>
+          </article>
+        </div>
+        <article class="panel table-panel">
+          <div class="panel-title">
+            <div>
+              <h2>용도 묶음별 소모 금액</h2>
+              <p id="purposeBasis">같은 역할을 하는 품번을 묶어서 소모 금액을 합산합니다.</p>
+            </div>
+            <span id="purposeCount" class="panel-count">0묶음</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>용도 묶음</th>
+                  <th class="number">품번 수</th>
+                  <th class="number">소모 지점 수</th>
+                  <th>포함 품목 예시</th>
+                  <th class="number">당월 소모 금액</th>
+                  <th id="purposeAverageHeader" class="number">평균 월금액</th>
+                  <th id="purposeForecastHeader" class="number">2개월 예상 금액</th>
+                  <th class="number">0원 소모 품번</th>
+                </tr>
+              </thead>
+              <tbody id="purposeBody"></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
+      <section id="exceptions" class="tab-page">
+        <article class="panel table-panel">
+          <div class="panel-title">
+            <div>
+              <h2>확인 필요 항목</h2>
+              <p>실재고 차이와 재고 부족 가능성을 모아서 봅니다. 단가 0원은 정상 값으로 유지합니다.</p>
+            </div>
+            <span id="exceptionCount" class="panel-count">0건</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>유형</th>
+                  <th>구분</th>
+                  <th>지점</th>
+                  <th>품번</th>
+                  <th>품명</th>
+                  <th>규격</th>
+                  <th>단위</th>
+                  <th class="number">현재고</th>
+                  <th id="exceptionConsumeHeader" class="number">월 소모</th>
+                  <th class="number">단가</th>
+                </tr>
+              </thead>
+              <tbody id="exceptionBody"></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
