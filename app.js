@@ -22,6 +22,7 @@ const SOURCES = [
 // Paste a deployed Google Apps Script Web App URL here to share 기타 메모 online.
 // Empty value keeps the current browser-only storage fallback.
 const OTHER_MEMO_API_URL = "https://script.google.com/macros/s/AKfycbxrvMafHyYAHVAJnv2ev_O9KPdNfa1ZVsiRq65CxzWYorzK8-8ZmbZy1-IfcH7ShFY/exec";
+const LIVE_DATA_API_URL = "https://script.google.com/macros/s/AKfycbyez3L9JLwzMkHrmpKrHhkyj7A_STKbdL8qM-3XX5C0LiYpgKnwLX8h4Ail1Vl5pioz/exec";
 
 const state = {
   rows: [],
@@ -99,6 +100,40 @@ function requestOtherMemoApi(params) {
       reject(new Error("memo api script load failed"));
     };
     script.src = otherMemoApiUrl({ ...params, callback: callbackName, v: Date.now() });
+    document.head.appendChild(script);
+  });
+}
+
+function requestJsonp(url, params = {}) {
+  return new Promise((resolve, reject) => {
+    if (!url) {
+      reject(new Error("missing JSONP URL"));
+      return;
+    }
+    const callbackName = `__jsonpCallback_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const script = document.createElement("script");
+    const timeout = window.setTimeout(() => {
+      cleanup();
+      reject(new Error("JSONP request timeout"));
+    }, 30000);
+    function cleanup() {
+      window.clearTimeout(timeout);
+      delete window[callbackName];
+      script.remove();
+    }
+    window[callbackName] = (payload) => {
+      cleanup();
+      resolve(payload || {});
+    };
+    script.onerror = () => {
+      cleanup();
+      reject(new Error("JSONP script load failed"));
+    };
+    const target = new URL(url);
+    Object.entries({ ...params, callback: callbackName, v: Date.now() }).forEach(([key, value]) => {
+      target.searchParams.set(key, value);
+    });
+    script.src = target.href;
     document.head.appendChild(script);
   });
 }
@@ -316,26 +351,77 @@ function bindEvents() {
 }
 
 async function loadSnapshot() {
-  setStatus("로컬 스냅샷 읽는 중...");
+  setStatus(LIVE_DATA_API_URL ? "구글시트 실시간 데이터 읽는 중..." : "로컬 스냅샷 읽는 중...");
   const dataUrl = new URL("./data.json", window.location.href).href;
   try {
-    const response = await fetch(`${dataUrl}?v=${Date.now()}`);
-    if (!response.ok) {
-      throw new Error(`data.json fetch failed: ${response.status}`);
-    }
-    const payload = await response.json();
-    state.rows = Array.isArray(payload.rows) ? payload.rows : [];
-    state.history = payload.history || {};
-    state.branches = ["전체", ...Array.from(new Set(state.rows.map((row) => row.branch))).sort()];
-    fillBranchFilter();
-    const generatedAt = payload.generatedAt ? new Date(payload.generatedAt).toLocaleString("ko-KR") : "시간 정보 없음";
-    setStatus(`스냅샷 ${generatedAt} / ${nf.format(state.rows.length)}개`);
+    const payload = LIVE_DATA_API_URL ? await requestJsonp(LIVE_DATA_API_URL) : await loadLocalSnapshot(dataUrl);
+    applyPayload(payload, LIVE_DATA_API_URL ? "구글시트 실시간" : "스냅샷");
     await loadSharedOtherNotes();
     render();
   } catch (error) {
     console.error(error);
+    if (LIVE_DATA_API_URL) {
+      try {
+        setStatus("실시간 연결 실패: 로컬 스냅샷으로 임시 표시합니다.", true);
+        const payload = await loadLocalSnapshot(dataUrl);
+        applyPayload(payload, "스냅샷");
+        await loadSharedOtherNotes();
+        render();
+        return;
+      } catch (fallbackError) {
+        console.error(fallbackError);
+      }
+    }
     setStatus(`data.json을 읽지 못했습니다. GitHub Pages에 index.html과 같은 위치로 data.json을 올렸는지 확인하세요. 확인 주소: ${dataUrl}`, true);
   }
+}
+
+async function loadLocalSnapshot(dataUrl) {
+  const response = await fetch(`${dataUrl}?v=${Date.now()}`);
+  if (!response.ok) {
+    throw new Error(`data.json fetch failed: ${response.status}`);
+  }
+  return response.json();
+}
+
+function applyPayload(payload, sourceLabel) {
+  if (!payload || !Array.isArray(payload.rows)) {
+    throw new Error("payload rows missing");
+  }
+    state.rows = Array.isArray(payload.rows) ? payload.rows : [];
+    state.history = payload.history || {};
+    if (payload.sourceMode === "google-sheets-live") normalizeLiveRows();
+    state.branches = ["전체", ...Array.from(new Set(state.rows.map((row) => row.branch))).sort()];
+    fillBranchFilter();
+    const generatedAt = payload.generatedAt ? new Date(payload.generatedAt).toLocaleString("ko-KR") : "시간 정보 없음";
+    setStatus(`${sourceLabel} ${generatedAt} / ${nf.format(state.rows.length)}개`);
+}
+
+function normalizeLiveRows() {
+  const latestBySource = {
+    vending: (state.history.vendingMonths || []).slice().sort().at(-1),
+    consumable: (state.history.consumableMonths || []).slice().sort().at(-1),
+  };
+  state.rows.forEach((row) => {
+    const latestPeriod = latestBySource[row.sourceId];
+    const latest = (row.monthlyHistory || []).find((month) => month.period === latestPeriod);
+    if (!latest) return;
+    row.monthlyConsume = latest.consume || 0;
+    row.monthlyDiscard = latest.discard || 0;
+    row.monthlyOther = latest.other || 0;
+    row.consumeAmount = latest.amount || 0;
+    row.salesAmount = latest.salesAmount || 0;
+    row.discardAmount = (latest.discard || 0) * (row.price || 0);
+  });
+
+  const vendingPriceByCode = new Map(
+    state.rows
+      .filter((row) => row.sourceId === "vending" && row.code)
+      .map((row) => [row.code, row.price || 0])
+  );
+  (state.history.vendingOtherRows || []).forEach((row) => {
+    if (!row.price) row.price = vendingPriceByCode.get(row.code) || 0;
+  });
 }
 
 async function fetchSheet(spreadsheetId, sheetName) {
