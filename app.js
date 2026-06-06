@@ -21,21 +21,26 @@ const SOURCES = [
 
 // Paste a deployed Google Apps Script Web App URL here to share 기타 메모 online.
 // Empty value keeps the current browser-only storage fallback.
-const OTHER_MEMO_API_URL = "https://script.google.com/macros/s/AKfycbxrvMafHyYAHVAJnv2ev_O9KPdNfa1ZVsiRq65CxzWYorzK8-8ZmbZy1-IfcH7ShFY/exec";
-const LIVE_DATA_API_URL = "https://script.google.com/macros/s/AKfycbyez3L9JLwzMkHrmpKrHhkyj7A_STKbdL8qM-3XX5C0LiYpgKnwLX8h4Ail1Vl5pioz/exec";
+const OTHER_MEMO_API_URL = "https://script.google.com/macros/s/AKfycbwLlb6nQBD36fbLQSnsfW0AgIBhZpQLUvdG5zN_knxAp-BrLcRxqd4--1hun9jmEKuc/exec";
+const LIVE_DATA_API_URL = "";
 
 const state = {
   rows: [],
   filteredRows: [],
   branches: [],
   history: {},
+  warehouse: { bySourceCode: {}, basisLabel: "" },
+  currentStockBasis: {},
+  lastDataStatus: "",
   activeTab: "overview",
   discardSelection: { period: null, branch: null },
   salesSelection: { period: null, branch: null },
   otherSelection: { period: null, branch: null },
   otherNotes: loadOtherNotes(),
+  appSettings: loadAppSettings(),
   memoSyncStatus: OTHER_MEMO_API_URL ? "online" : "local",
   activeOtherNote: null,
+  exclusionPanelOpen: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -51,6 +56,10 @@ function eaText(value, formatter = nf) {
   return `${formatter.format(Number(value) || 0)} EA`;
 }
 
+function stockCell(row) {
+  return escapeHtml(qtyText(row, row.stock));
+}
+
 function loadOtherNotes() {
   try {
     return JSON.parse(localStorage.getItem("inventory.vendingOtherNotes") || "{}");
@@ -64,6 +73,39 @@ function saveOtherNotes() {
     localStorage.setItem("inventory.vendingOtherNotes", JSON.stringify(state.otherNotes));
   } catch (error) {
     console.warn("memo save failed", error);
+  }
+}
+
+function defaultAppSettings() {
+  return {
+    branchAdds: [],
+    branchRenames: {},
+    branchHidden: [],
+    vendingExclusions: [],
+  };
+}
+
+function loadAppSettings() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem("inventory.appSettings") || "{}");
+    return {
+      ...defaultAppSettings(),
+      ...parsed,
+      branchAdds: Array.isArray(parsed.branchAdds) ? parsed.branchAdds : [],
+      branchRenames: parsed.branchRenames && typeof parsed.branchRenames === "object" ? parsed.branchRenames : {},
+      branchHidden: Array.isArray(parsed.branchHidden) ? parsed.branchHidden : [],
+      vendingExclusions: Array.isArray(parsed.vendingExclusions) ? parsed.vendingExclusions : [],
+    };
+  } catch {
+    return defaultAppSettings();
+  }
+}
+
+function saveAppSettings() {
+  try {
+    localStorage.setItem("inventory.appSettings", JSON.stringify(state.appSettings));
+  } catch (error) {
+    console.warn("app settings save failed", error);
   }
 }
 
@@ -173,7 +215,7 @@ async function loadSharedOtherNotes({ silent = false } = {}) {
   } catch (error) {
     console.warn("online memo load failed", error);
     state.memoSyncStatus = "fallback";
-    setOtherMemoSyncStatus("온라인 메모 연결 실패: 이 브라우저 저장값으로 임시 표시합니다.", true);
+    setOtherMemoSyncStatus("온라인 메모 연결 실패: Apps Script 배포 권한을 '모든 사용자'로 설정해야 링크 접속자도 같은 메모를 볼 수 있습니다.", true);
   }
 }
 
@@ -216,7 +258,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
 function bindEvents() {
   $("reloadButton").addEventListener("click", loadSnapshot);
-  $("datasetFilter").addEventListener("change", render);
+  $("datasetFilter").addEventListener("change", () => {
+    fillBranchFilter();
+    render();
+  });
   $("branchFilter").addEventListener("change", render);
   $("historyStart").addEventListener("change", () => {
     if ($("historyStart").value > $("historyEnd").value) $("historyEnd").value = $("historyStart").value;
@@ -229,8 +274,8 @@ function bindEvents() {
   $("safetyMonths").addEventListener("input", render);
   $("deliveryWeeks").addEventListener("input", render);
   $("searchInput").addEventListener("input", render);
-  $("exportPurchase").addEventListener("click", exportPurchaseCsv);
-  $("exportDelivery").addEventListener("click", exportDeliveryCsv);
+  $("exportPurchase").addEventListener("click", exportPurchaseXlsx);
+  $("exportDelivery").addEventListener("click", exportDeliveryXlsx);
   $("clearDiscardSelection").addEventListener("click", () => {
     state.discardSelection = { period: null, branch: null };
     render();
@@ -280,9 +325,16 @@ function bindEvents() {
     render();
   });
   $("vendingOtherBody").addEventListener("click", (event) => {
-    const button = event.target.closest("[data-other-note-key]");
-    if (!button) return;
-    openOtherMemo(button.dataset.otherNoteKey, button.dataset.otherNoteLabel);
+    const memoCell = event.target.closest("[data-other-note-key]");
+    if (!memoCell) return;
+    openOtherMemo(memoCell.dataset.otherNoteKey, memoCell.dataset.otherNoteLabel);
+  });
+  $("vendingOtherBody").addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    const memoCell = event.target.closest("[data-other-note-key]");
+    if (!memoCell) return;
+    event.preventDefault();
+    openOtherMemo(memoCell.dataset.otherNoteKey, memoCell.dataset.otherNoteLabel);
   });
   $("saveOtherMemo").addEventListener("click", async () => {
     if (!state.activeOtherNote) return;
@@ -295,7 +347,7 @@ function bindEvents() {
       openOtherMemo(active.key, active.label);
     } catch (error) {
       console.error(error);
-      setOtherMemoSyncStatus("메모 저장 실패: 연결 상태를 확인하세요.", true);
+      setOtherMemoSyncStatus("메모 저장 실패: Apps Script 배포 권한을 '모든 사용자'로 설정해야 온라인 공유 저장이 됩니다.", true);
     }
   });
   $("deleteOtherMemo").addEventListener("click", async () => {
@@ -308,7 +360,7 @@ function bindEvents() {
       openOtherMemo(active.key, active.label);
     } catch (error) {
       console.error(error);
-      setOtherMemoSyncStatus("메모 삭제 실패: 연결 상태를 확인하세요.", true);
+      setOtherMemoSyncStatus("메모 삭제 실패: Apps Script 배포 권한을 '모든 사용자'로 설정해야 온라인 공유 삭제가 됩니다.", true);
     }
   });
   $("closeOtherMemo").addEventListener("click", () => {
@@ -333,11 +385,19 @@ function bindEvents() {
     };
     render();
   });
-  $("vendingBranchButtons").addEventListener("click", (event) => {
-    const button = event.target.closest("[data-branch]");
-    if (!button) return;
-    $("branchFilter").value = button.dataset.branch;
-    render();
+  $("vendingBranchButtons").addEventListener("change", (event) => {
+    if (event.target.id === "excludeCodeInput") {
+      fillVendingExclusionProduct();
+      return;
+    }
+  });
+  $("vendingBranchButtons").addEventListener("input", (event) => {
+    if (event.target.id === "excludeCodeInput") fillVendingExclusionProduct();
+  });
+  $("vendingBranchButtons").addEventListener("click", handleVendingSettingsClick);
+  $("openExclusionPanel").addEventListener("click", () => {
+    state.exclusionPanelOpen = true;
+    $("exclusionPanel")?.classList.remove("hidden");
   });
 
   document.querySelectorAll(".tab").forEach((button) => {
@@ -350,17 +410,84 @@ function bindEvents() {
   });
 }
 
+function handleVendingSettingsClick(event) {
+  const target = event.target;
+  if (!(target instanceof HTMLElement)) return;
+  if (target.id === "closeExclusionPanel") {
+    state.exclusionPanelOpen = false;
+    $("exclusionPanel")?.classList.add("hidden");
+    return;
+  }
+  if (target.id === "excludeAddButton") {
+    const code = normalizeCode($("excludeCodeInput")?.value);
+    const name = $("excludeNameInput")?.value.trim() || "";
+    const spec = $("excludeSpecInput")?.value.trim() || "";
+    const startDate = $("excludeStartDateInput")?.value || "";
+    const editingId = $("excludeEditingId")?.value || "";
+    if (!code || !startDate) return;
+    if (editingId) {
+      state.appSettings.vendingExclusions = state.appSettings.vendingExclusions.map((item) =>
+        item.id === editingId ? { ...item, code, name, spec, startDate } : item
+      );
+    } else {
+      const id = `${code}-${startDate}-${Date.now()}`;
+      state.appSettings.vendingExclusions.push({ id, code, name, spec, startDate });
+    }
+    state.exclusionPanelOpen = true;
+    saveAppSettings();
+    render();
+    return;
+  }
+  const editExclusionId = target.getAttribute("data-exclusion-edit");
+  if (editExclusionId) {
+    const item = state.appSettings.vendingExclusions.find((candidate) => candidate.id === editExclusionId);
+    if (!item) return;
+    $("excludeCodeInput").value = item.code || "";
+    $("excludeNameInput").value = item.name || "";
+    $("excludeSpecInput").value = item.spec || "";
+    $("excludeStartDateInput").value = item.startDate || "";
+    $("excludeEditingId").value = item.id;
+    return;
+  }
+  const exclusionId = target.getAttribute("data-exclusion-delete");
+  if (exclusionId) {
+    state.appSettings.vendingExclusions = state.appSettings.vendingExclusions.filter((item) => item.id !== exclusionId);
+    state.exclusionPanelOpen = true;
+    saveAppSettings();
+    render();
+  }
+}
+
+function clearExclusionInputs() {
+  $("excludeCodeInput").value = "";
+  $("excludeNameInput").value = "";
+  $("excludeSpecInput").value = "";
+  $("excludeStartDateInput").value = "";
+  $("excludeEditingId").value = "";
+}
+
+function fillVendingExclusionProduct() {
+  const code = normalizeCode($("excludeCodeInput")?.value);
+  if (!code) return;
+  const row = state.rows.find((item) => item.sourceId === "vending" && normalizeCode(item.code) === code);
+  if (!row) return;
+  if (!$("excludeNameInput").value.trim()) $("excludeNameInput").value = row.category || "";
+  if (!$("excludeSpecInput").value.trim()) $("excludeSpecInput").value = row.spec || "";
+}
+
 async function loadSnapshot() {
-  setStatus(LIVE_DATA_API_URL ? "구글시트 실시간 데이터 읽는 중..." : "로컬 스냅샷 읽는 중...");
   const dataUrl = new URL("./data.json", window.location.href).href;
+  const isLocalPreview = ["127.0.0.1", "localhost", ""].includes(window.location.hostname);
+  const useLiveDataApi = Boolean(LIVE_DATA_API_URL && !isLocalPreview);
+  setStatus(useLiveDataApi ? "구글시트 실시간 데이터 읽는 중..." : "로컬 스냅샷 읽는 중...");
   try {
-    const payload = LIVE_DATA_API_URL ? await requestJsonp(LIVE_DATA_API_URL) : await loadLocalSnapshot(dataUrl);
-    applyPayload(payload, LIVE_DATA_API_URL ? "구글시트 실시간" : "스냅샷");
+    const payload = useLiveDataApi ? await requestJsonp(LIVE_DATA_API_URL) : await loadLocalSnapshot(dataUrl);
+    applyPayload(payload, useLiveDataApi ? "구글시트 실시간" : "스냅샷");
     await loadSharedOtherNotes();
     render();
   } catch (error) {
     console.error(error);
-    if (LIVE_DATA_API_URL) {
+    if (useLiveDataApi) {
       try {
         setStatus("실시간 연결 실패: 로컬 스냅샷으로 임시 표시합니다.", true);
         const payload = await loadLocalSnapshot(dataUrl);
@@ -390,11 +517,14 @@ function applyPayload(payload, sourceLabel) {
   }
     state.rows = Array.isArray(payload.rows) ? payload.rows : [];
     state.history = payload.history || {};
+    state.warehouse = normalizeWarehousePayload(payload.warehouse);
+    state.currentStockBasis = payload.currentStockBasis || {};
     if (payload.sourceMode === "google-sheets-live") normalizeLiveRows();
     state.branches = ["전체", ...Array.from(new Set(state.rows.map((row) => row.branch))).sort()];
     fillBranchFilter();
     const generatedAt = payload.generatedAt ? new Date(payload.generatedAt).toLocaleString("ko-KR") : "시간 정보 없음";
-    setStatus(`${sourceLabel} ${generatedAt} / ${nf.format(state.rows.length)}개`);
+    state.lastDataStatus = `${sourceLabel} ${generatedAt} / ${nf.format(state.rows.length)}개`;
+    setStatus(state.lastDataStatus);
 }
 
 function normalizeLiveRows() {
@@ -424,9 +554,241 @@ function normalizeLiveRows() {
   });
 }
 
+function normalizeWarehousePayload(warehouse) {
+  const bySourceCode = {};
+  (warehouse?.rows || []).forEach((row) => {
+    const code = normalizeCode(row.code);
+    if (!code) return;
+    const sourceIds = !row.sourceId || row.sourceId === "all" ? ["vending", "consumable"] : [row.sourceId];
+    sourceIds.forEach((sourceId) => {
+      const key = `${sourceId}||${code}`;
+      const current = bySourceCode[key] || {
+        sourceId,
+        code,
+        category: row.category || "",
+        spec: row.spec || "",
+        unit: row.unit || "EA",
+        stock: 0,
+      };
+      current.stock += toNumber(row.stock);
+      bySourceCode[key] = current;
+    });
+  });
+  return {
+    bySourceCode,
+    basisLabel: warehouse?.basisLabel || warehouse?.generatedAt || "",
+  };
+}
+
+function warehouseStockFor(row) {
+  return toNumber(state.warehouse.bySourceCode?.[`${row.sourceId}||${row.code}`]?.stock);
+}
+
+function originalBranchesForDataset(dataset) {
+  return Array.from(new Set(state.rows.filter((row) => row.sourceId === dataset).map((row) => row.branch))).sort((a, b) => a.localeCompare(b, "ko"));
+}
+
+function branchDisplayName(branch) {
+  return branch;
+}
+
+function branchSourceName(displayName) {
+  return displayName;
+}
+
+function isBranchHidden(branch) {
+  return false;
+}
+
+function effectiveBranchesForDataset(dataset) {
+  return ["\uC804\uCCB4", ...originalBranchesForDataset(dataset)];
+}
+
+function applyBranchSettings(row) {
+  return row;
+}
+
+function latestPeriod(periods) {
+  return Array.isArray(periods) && periods.length ? periods.slice().sort().at(-1) : "";
+}
+
+function exclusionPeriod(exclusion) {
+  return String(exclusion.startDate || "").slice(0, 7);
+}
+
+function activeVendingExclusionCodes(analysisPeriods) {
+  const latest = latestPeriod(analysisPeriods);
+  if (!latest) return new Set();
+  return new Set(
+    state.appSettings.vendingExclusions
+      .filter((exclusion) => normalizeCode(exclusion.code) && exclusionPeriod(exclusion) && exclusionPeriod(exclusion) <= latest)
+      .map((exclusion) => normalizeCode(exclusion.code))
+  );
+}
+
+function isExcludedFromVendingPlan(row, analysisPeriods) {
+  return row.sourceId === "vending" && activeVendingExclusionCodes(analysisPeriods).has(normalizeCode(row.code));
+}
+
+async function refreshCurrentStocksFromSourceSheets() {
+  const overlays = await Promise.all(SOURCES.map((source) => loadSourceCurrentStock(source)));
+  const stockMap = new Map();
+  state.currentStockBasis = {};
+
+  overlays.forEach((overlay) => {
+    if (!overlay) return;
+    state.currentStockBasis[overlay.sourceId] = overlay.basisLabel;
+    overlay.rows.forEach((row) => {
+      stockMap.set([overlay.sourceId, row.branch, row.code].join("||"), row);
+    });
+  });
+
+  state.rows.forEach((row) => {
+    const current = stockMap.get([row.sourceId, row.branch, row.code].join("||"));
+    if (!current) return;
+    row.stock = current.stock;
+    row.actualStock = current.actualStock;
+    row.stockGap = current.actualStock === null ? 0 : current.actualStock - current.stock;
+    row.currentStockBasisLabel = current.basisLabel;
+  });
+}
+
+async function loadSourceCurrentStock(source) {
+  try {
+    const refRows = await fetchSheet(source.spreadsheetId, source.refSheet);
+    const itemMap = parseRef(refRows, source);
+    const branchSheets = await Promise.all(source.branches.map(async (branch) => ({
+      branch,
+      rows: await fetchSheet(source.spreadsheetId, branch),
+    })));
+    const branchBlocks = branchSheets.map(({ branch, rows }) => ({
+      branch,
+      rows,
+      blocks: detectCurrentBlocks(rows, source),
+    }));
+    const basis = chooseCommonCurrentBasis(branchBlocks);
+    const stockRows = branchBlocks.flatMap(({ branch, rows, blocks }) => {
+      const block = blocks.find((candidate) => candidate.key === basis.key) || blocks.at(-1);
+      return block ? currentRowsForBlock(rows, source, branch, itemMap, block, basis.label) : [];
+    });
+    return { sourceId: source.id, basisLabel: basis.label, rows: aggregateCurrentRows(stockRows) };
+  } catch (error) {
+    console.warn(`${source.label} current stock refresh failed`, error);
+    return null;
+  }
+}
+
+function detectCurrentBlocks(rows, source) {
+  const dateRow = rows[0] || [];
+  const headerRow = rows[1] || [];
+  const firstBlockColumn = source.id === "vending" ? 4 : 3;
+  const blocks = [];
+  for (let col = firstBlockColumn; col < headerRow.length; col += 7) {
+    const stockHeader = headerRow[col + 5] || "";
+    const actualHeader = headerRow[col + 6] || "";
+    const dateInfo = normalizeSheetDate(dateRow[col]);
+    if (!dateInfo || !String(actualHeader).includes("실재고") || !stockHeader) continue;
+    const actualCount = rows.slice(2).filter((row) => normalizeCode(row[0]) && row[col + 6] !== "").length;
+    if (actualCount === 0) continue;
+    blocks.push({
+      ...dateInfo,
+      stock: col + 5,
+      actual: col + 6,
+      actualCount,
+    });
+  }
+  return blocks;
+}
+
+function normalizeSheetDate(value) {
+  const text = String(value || "").trim();
+  if (!text) return null;
+  const dateFunction = text.match(/Date\((\d{4}),\s*(\d{1,2}),\s*(\d{1,2})\)/);
+  if (dateFunction) {
+    const year = Number(dateFunction[1]);
+    const month = Number(dateFunction[2]) + 1;
+    const day = Number(dateFunction[3]);
+    return sheetDateInfo(year, month, day);
+  }
+  const normalized = text.replace(/[.]/g, "/").replace(/\s/g, "");
+  const parts = normalized.split("/").map((part) => Number(part));
+  if (parts.length === 3 && parts.every(Number.isFinite)) {
+    const [first, second, third] = parts;
+    return first > 31 ? sheetDateInfo(first, second, third) : sheetDateInfo(2000 + third, first, second);
+  }
+  if (parts.length === 2 && parts.every(Number.isFinite)) {
+    return sheetDateInfo(new Date().getFullYear(), parts[0], parts[1]);
+  }
+  return null;
+}
+
+function sheetDateInfo(year, month, day) {
+  if (!year || !month || !day) return null;
+  const key = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  return {
+    key,
+    sortValue: new Date(year, month - 1, day).getTime(),
+    label: `${month}/${day} 실재고`,
+  };
+}
+
+function chooseCommonCurrentBasis(branchBlocks) {
+  const [first, ...rest] = branchBlocks;
+  let common = new Set((first?.blocks || []).map((block) => block.key));
+  rest.forEach(({ blocks }) => {
+    const keys = new Set(blocks.map((block) => block.key));
+    common = new Set([...common].filter((key) => keys.has(key)));
+  });
+  const candidates = branchBlocks.flatMap(({ blocks }) => blocks).filter((block) => common.has(block.key));
+  const chosen = candidates.sort((a, b) => b.sortValue - a.sortValue)[0];
+  if (chosen) return { key: chosen.key, label: chosen.label };
+  const fallback = branchBlocks
+    .flatMap(({ blocks }) => blocks)
+    .sort((a, b) => b.sortValue - a.sortValue)[0];
+  return fallback ? { key: fallback.key, label: `${fallback.label} 기준` } : { key: "", label: "원본 재고파일" };
+}
+
+function currentRowsForBlock(rows, source, branch, itemMap, block, basisLabel) {
+  return rows.slice(2).flatMap((row) => {
+    const code = normalizeCode(row[0]);
+    if (!code) return [];
+    const ref = itemMap.get(code) || {};
+    const stock = toNumber(row[block.stock]);
+    const actualRaw = row[block.actual];
+    const actualStock = actualRaw === "" ? null : toNumber(actualRaw);
+    return [{
+      sourceId: source.id,
+      branch,
+      code,
+      stock: actualStock === null ? stock : actualStock,
+      actualStock,
+      currentStockBasisLabel: basisLabel,
+    }];
+  });
+}
+
+function aggregateCurrentRows(rows) {
+  const map = new Map();
+  rows.forEach((row) => {
+    const key = [row.branch, row.code].join("||");
+    const target = map.get(key) || { ...row, stock: 0, actualStock: null };
+    target.stock += row.stock;
+    target.actualStock = target.actualStock === null && row.actualStock === null ? null : (target.actualStock || 0) + (row.actualStock || 0);
+    map.set(key, target);
+  });
+  return Array.from(map.values());
+}
+
 async function fetchSheet(spreadsheetId, sheetName) {
   const url = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(sheetName)}`;
-  const response = await fetch(url, { credentials: "include" });
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 12000);
+  let response;
+  try {
+    response = await fetch(url, { credentials: "omit", signal: controller.signal });
+  } finally {
+    window.clearTimeout(timeout);
+  }
   if (!response.ok) {
     throw new Error(`${sheetName} fetch failed: ${response.status}`);
   }
@@ -609,7 +971,11 @@ function aggregateRows(rows) {
 }
 
 function fillBranchFilter() {
-  $("branchFilter").innerHTML = state.branches.map((branch) => `<option value="${escapeHtml(branch)}">${escapeHtml(branch)}</option>`).join("");
+  const dataset = $("datasetFilter")?.value || "consumable";
+  const branches = dataset === "all" ? state.branches : effectiveBranchesForDataset(dataset);
+  const current = $("branchFilter").value || "전체";
+  $("branchFilter").innerHTML = branches.map((branch) => `<option value="${escapeHtml(branch)}">${escapeHtml(branch)}</option>`).join("");
+  $("branchFilter").value = branches.includes(current) ? current : branches[0];
 }
 
 function render() {
@@ -633,7 +999,7 @@ function render() {
   const analysisLabel = describePeriodRange(analysisPeriods);
   const safetyMonths = Math.max(1, toNumber($("safetyMonths").value) || 2);
   const deliveryWeeks = Math.max(1, toNumber($("deliveryWeeks").value) || 2);
-  $("safetyLabel").textContent = vendingMode ? "구매 목표(개월)" : consumableMode ? "예측 기간(개월)" : "안전재고";
+  $("safetyLabel").textContent = "구매목표(개월)";
   $("deliveryWeeksField").classList.toggle("hidden", !vendingMode);
   $("deliveryTab").classList.toggle("hidden", !vendingMode);
   $("discardTab").classList.toggle("hidden", !vendingMode);
@@ -643,35 +1009,20 @@ function render() {
   $("overviewTab").textContent = vendingMode ? "판매" : "현황";
   $("consumeMetricLabel").textContent = vendingMode ? "당월 판매 수량" : consumableMode ? "당월 소모 수량" : "월 소모/판매 수량";
   $("consumeAmountMetricLabel").textContent = vendingMode ? "당월 매출" : "월 소모 금액";
-  $("purchaseMetricLabel").textContent = vendingMode && state.activeTab === "delivery" ? "하이랙스 배송 필요 금액" : vendingMode || consumableMode ? "구매필요 금액" : "구매 추천 금액";
+  $("purchaseMetricLabel").textContent = vendingMode && state.activeTab === "delivery" ? "배송 필요 수량" : vendingMode || consumableMode ? "구매필요 금액" : "구매 추천 금액";
   $("overviewTitle").textContent = vendingMode ? "자판기 판매 현황" : consumableMode ? "지점별 소모품 현황" : "현재고 현황";
   $("branchAmountTitle").textContent = vendingMode ? "지점별 당월 매출" : "지점별 당월 소모 금액";
   $("topConsumeTitle").textContent = vendingMode ? "판매 상위 품목" : "소모/판매 상위 품목";
   $("categoryAmountTitle").textContent = vendingMode ? "카테고리별 당월 매출" : "카테고리별 소모 금액";
   $("discardAmountTitle").textContent = vendingMode ? "폐기 금액 상위" : "이동 금액 상위";
-  $("purchaseTitle").textContent = vendingMode
-    ? `구매필요 계획 (기준: ${analysisLabel} 평균 판매, 목표: ${nf.format(safetyMonths)}개월분)`
-    : consumableMode
-      ? `구매필요 계획 (기준: ${analysisLabel} 평균 소모, 목표: ${nf.format(safetyMonths)}개월분)`
-      : `${nf.format(safetyMonths)}개월 안전재고 기준 구매 추천`;
-  $("deliveryTitle").textContent = `하이랙스 창고 배송 계획 (주기: ${nf.format(deliveryWeeks)}주)`;
-  $("deliveryBasis").textContent = `당월 판매량을 4주 기준으로 환산해, 현재 지점 재고를 다음 ${nf.format(deliveryWeeks)}주 판매 예상량까지 채우기 위한 배송량입니다. 하이랙스 창고의 보유 수량은 아직 반영하지 않습니다.`;
-  const historyDescriptions = [
-    describeHistory("경상소모품", state.history.consumableMonths),
-    describeHistory("자판기 상품", state.history.vendingMonths),
-  ].filter(Boolean);
-  $("purchaseBasis").textContent = vendingMode
-    ? `품번이 같은 상품만 동일 품목으로 집계합니다. ${describeSelectedHistory("자판기 상품", analysisPeriods)} 판매량을 기준으로, 현재 재고에서 추가로 확보할 구매필요 수량입니다.${branch === "전체" ? " 전체 보기에서는 품번별로 필요한 지점의 수량을 합산합니다." : ""}`
-    : consumableMode
-      ? `${describeSelectedHistory("경상소모품", analysisPeriods)} 소모량을 기준으로, 각 지점의 현재 재고에서 부족한 ${nf.format(safetyMonths)}개월 예상 소모분을 구매필요로 계산합니다.`
-    : historyDescriptions.length
-      ? `${historyDescriptions.join(", ")} 소모량을 기준으로 계산합니다. 입고예정수량은 아직 0으로 계산합니다.`
-      : "당월 소모량을 기준으로 계산합니다. 입고예정수량은 아직 0으로 계산합니다.";
+  $("deliveryTitle").textContent = "배송";
   setVendingHeaders(vendingMode, consumableMode, analysisMonths, safetyMonths);
   renderBranchFilters(dataset, branch, safetyMonths, deliveryWeeks, analysisPeriods);
 
   state.filteredRows = state.rows
     .filter((row) => dataset === "all" || row.sourceId === dataset)
+    .map(applyBranchSettings)
+    .filter(Boolean)
     .filter((row) => branch === "전체" || row.branch === branch)
     .filter((row) => {
       if (!query) return true;
@@ -692,30 +1043,76 @@ function render() {
 
 function renderBranchFilters(dataset, selectedBranch, safetyMonths, deliveryWeeks, analysisPeriods) {
   const panel = $("vendingBranchFilters");
-  const visible = dataset === "vending" || dataset === "consumable";
-  panel.classList.toggle("hidden", !visible);
-  if (!visible) return;
   const vendingMode = dataset === "vending";
-  $("branchFilterTitle").textContent = vendingMode ? "지점별 보기" : "지점별 소모 금액 및 구매필요";
-  $("branchFilterDescription").textContent = vendingMode
-    ? "지점을 선택하면 아래 판매·폐기, 배송 및 구매필요 계획이 해당 지점 기준으로 표시됩니다."
-    : `각 지점의 당월 소모 금액과 ${nf.format(safetyMonths)}개월 예상 소모량 기준 구매필요 금액을 비교할 수 있습니다.`;
+  panel.classList.toggle("hidden", !vendingMode);
+  $("openExclusionPanel").classList.toggle("hidden", !vendingMode);
+  if (!vendingMode) {
+    state.exclusionPanelOpen = false;
+    $("vendingBranchButtons").innerHTML = "";
+    return;
+  }
+  $("vendingBranchButtons").innerHTML = renderVendingSettingsPanel();
+}
 
-  const rows = state.rows.filter((row) => row.sourceId === dataset);
-  const branchNames = ["전체", ...Array.from(new Set(rows.map((row) => row.branch))).sort((a, b) => a.localeCompare(b, "ko"))];
-  $("vendingBranchButtons").innerHTML = branchNames.map((branch) => {
-    const branchRows = branch === "전체" ? rows : rows.filter((row) => row.branch === branch);
-    const plannedRows = branchRows.map((row) => withPurchase(row, safetyMonths, deliveryWeeks, analysisPeriods));
-    const isActive = selectedBranch === branch;
-    return `
-      <button class="branch-card ${isActive ? "active" : ""}" data-branch="${escapeHtml(branch)}" type="button" aria-pressed="${isActive}">
-        <strong>${escapeHtml(branch)}</strong>
-        ${vendingMode
-          ? `<span>당월 판매 ${nf.format(sum(branchRows, "monthlyConsume"))}</span><span>매출 ${cf.format(sum(branchRows, "salesAmount"))}</span>`
-          : `<span>소모금액 ${cf.format(sum(branchRows, "consumeAmount"))}</span><span>구매필요 ${cf.format(sum(plannedRows, "purchaseAmount"))}</span>`}
-      </button>
-    `;
-  }).join("");
+function renderVendingSettingsPanel() {
+  const exclusions = state.appSettings.vendingExclusions;
+  const itemOptions = Array.from(new Map(state.rows
+    .filter((row) => row.sourceId === "vending" && row.code)
+    .map((row) => [row.code, row]))
+    .values())
+    .sort((a, b) => a.code.localeCompare(b.code, "ko"));
+  return `
+    <div id="exclusionPanel" class="exclusion-modal ${state.exclusionPanelOpen ? "" : "hidden"}" role="dialog" aria-modal="true" aria-label="&#54032;&#47588; &#51228;&#50808; &#47785;&#47197;">
+      <article class="vending-settings-card">
+        <div class="settings-card-title exclusion-modal-title">
+          <h3>&#54032;&#47588; &#51228;&#50808; &#47785;&#47197;</h3>
+          <button id="closeExclusionPanel" type="button" class="secondary">&#45803;&#44592;</button>
+        </div>
+        <div class="settings-input-grid exclusion-settings-inputs">
+          <label>
+            <span>&#54408;&#48264;</span>
+            <input id="excludeCodeInput" type="text" list="excludeProductOptions" placeholder="&#54408;&#48264;" />
+          </label>
+          <label>
+            <span>&#54408;&#47749;</span>
+            <input id="excludeNameInput" type="text" placeholder="&#49345;&#54408;&#47749;" />
+          </label>
+          <label>
+            <span>&#44508;&#44201;</span>
+            <input id="excludeSpecInput" type="text" placeholder="&#44508;&#44201;" />
+          </label>
+          <label>
+            <span>&#54032;&#47588; &#51228;&#50808; &#49884;&#51089;&#51068;</span>
+            <input id="excludeStartDateInput" type="date" />
+          </label>
+          <input id="excludeEditingId" type="hidden" />
+          <div class="settings-action-row exclusion-action-row">
+            <button id="excludeAddButton" type="button">&#54032;&#47588; &#51228;&#50808;</button>
+          </div>
+        </div>
+        <datalist id="excludeProductOptions">
+          ${itemOptions.map((row) => `<option value="${escapeHtml(row.code)}">${escapeHtml(row.category)} ${escapeHtml(row.spec)}</option>`).join("")}
+        </datalist>
+        <div class="settings-subtitle">&#54032;&#47588; &#51228;&#50808; &#45236;&#50669;</div>
+        <div class="settings-list exclusion-list">
+          ${exclusions.map((item) => `
+            <div class="exclusion-row-card">
+              <div>
+                <strong>${escapeHtml(item.code)}</strong>
+                <span>${escapeHtml(item.name || "-")}</span>
+                <small>${escapeHtml(item.spec || "-")}</small>
+              </div>
+              <em>${escapeHtml(item.startDate || "")}&#48512;&#53552; &#54032;&#47588; &#51228;&#50808;</em>
+              <div class="row-actions">
+                <button type="button" data-exclusion-edit="${escapeHtml(item.id)}">&#49688;&#51221;</button>
+                <button type="button" data-exclusion-delete="${escapeHtml(item.id)}">&#49325;&#51228;</button>
+              </div>
+            </div>
+          `).join("") || `<span class="settings-empty">&#54032;&#47588; &#51228;&#50808; &#49345;&#54408; &#50630;&#51020;</span>`}
+        </div>
+      </article>
+    </div>
+  `;
 }
 
 function describeHistory(label, periods) {
@@ -773,6 +1170,13 @@ function formatPeriodShort(period) {
   return `${year.slice(2)}년 ${Number(month)}월`;
 }
 
+function formatDiscardDetailDateLabel(dateText) {
+  if (!dateText) return "-";
+  const [year, month, day] = String(dateText).split("-");
+  if (!year || !month || !day) return String(dateText);
+  return `${Number(month)}/${Number(day)}`;
+}
+
 function selectedHistory(row, analysisPeriods) {
   const selectedSet = new Set(analysisPeriods);
   const history = (row.monthlyHistory || []).filter((month) => selectedSet.has(month.period));
@@ -792,7 +1196,8 @@ function withPurchase(row, safetyMonths, deliveryWeeks, analysisPeriods) {
   const planningMonthlyConsume = usesHistory ? selected.avgConsume : row.monthlyConsume;
   const recommendedStock = Math.ceil(planningMonthlyConsume * safetyMonths);
   const purchaseQty = Math.max(0, recommendedStock - row.stock);
-  const deliveryWeeklySales = row.monthlyConsume / 4;
+  const deliveryMonthlySales = planningMonthlyConsume;
+  const deliveryWeeklySales = deliveryMonthlySales / 4.345;
   const deliveryTargetStock = Math.ceil(deliveryWeeklySales * deliveryWeeks);
   const deliveryQty = Math.max(0, deliveryTargetStock - row.stock);
   return {
@@ -807,6 +1212,7 @@ function withPurchase(row, safetyMonths, deliveryWeeks, analysisPeriods) {
     purchaseQty,
     purchaseAmount: purchaseQty * row.price,
     deliveryWeeks,
+    deliveryMonthlySales,
     deliveryWeeklySales,
     deliveryTargetStock,
     deliveryQty,
@@ -819,8 +1225,13 @@ function renderMetrics() {
   $("totalConsumeQty").textContent = nf.format(sum(state.filteredRows, "monthlyConsume"));
   const revenueKey = $("datasetFilter").value === "vending" ? "salesAmount" : "consumeAmount";
   $("totalConsumeAmount").textContent = cf.format(sum(state.filteredRows, revenueKey));
-  const metricKey = $("datasetFilter").value === "vending" && state.activeTab === "delivery" ? "deliveryAmount" : "purchaseAmount";
-  $("totalPurchaseAmount").textContent = cf.format(sum(state.filteredRows, metricKey));
+  if (state.activeTab === "purchase") {
+    $("totalPurchaseAmount").textContent = cf.format(sum(purchaseRows(), "purchaseAmount"));
+  } else if ($("datasetFilter").value === "vending" && state.activeTab === "delivery") {
+    $("totalPurchaseAmount").textContent = eaText(sum(state.filteredRows, "deliveryQty"));
+  } else {
+    $("totalPurchaseAmount").textContent = cf.format(sum(state.filteredRows, "purchaseAmount"));
+  }
 }
 
 function renderOverview(analysisPeriods) {
@@ -844,7 +1255,7 @@ function renderOverview(analysisPeriods) {
       <td>${escapeHtml(row.category)}</td>
       <td>${escapeHtml(row.spec)}</td>
       <td>${escapeHtml(row.unit || "EA")}</td>
-      <td class="number">${escapeHtml(qtyText(row, row.stock))}</td>
+      <td class="number">${stockCell(row)}</td>
       <td class="number">${escapeHtml(vendingMode ? qtyText(row, row.avgMonthlyConsume, df) : qtyText(row, row.monthlyConsume))}</td>
       ${vendingMode ? "" : `<td class="number">${escapeHtml(qtyText(row, row.monthlyDiscard))}</td>`}
       <td class="number">${cf.format(row.price)}</td>
@@ -918,33 +1329,29 @@ function renderVendingSales(analysisPeriods) {
   $("overviewTitle").textContent = selectedTitle ? `자판기 판매 세부내역 (${selectedTitle})` : "자판기 판매 세부내역";
   $("overviewCount").textContent = `${nf.format(detailRows.length)}건 / 총 ${nf.format(sum(detailRows, "detailSalesQty"))} EA / ${cf.format(sum(detailRows, "detailSalesAmount"))}`;
   $("overviewHeaderRow").innerHTML = `
-    <th>구분</th>
     <th>지점</th>
     <th>품번</th>
     <th>품명</th>
     <th>규격</th>
     <th>단위</th>
-    <th class="number">현재고</th>
     <th class="number">판매 수량</th>
-    <th class="number">구매단가</th>
-    <th class="number">판매단가</th>
+    <th class="number">구매 단가</th>
+    <th class="number">판매 단가</th>
     <th class="number">매출</th>
   `;
   $("overviewBody").innerHTML = detailRows.slice(0, 350).map((row) => `
     <tr>
-      <td>${typePill(row)}</td>
       <td>${escapeHtml(row.branch)}</td>
       <td>${escapeHtml(row.code)}</td>
       <td>${escapeHtml(row.category)}</td>
       <td>${escapeHtml(row.spec)}</td>
       <td>${escapeHtml(row.unit || "EA")}</td>
-      <td class="number">${escapeHtml(qtyText(row, row.stock))}</td>
       <td class="number">${escapeHtml(qtyText(row, row.detailSalesQty))}</td>
       <td class="number">${cf.format(row.price)}</td>
       <td class="number">${cf.format(row.salePrice || 0)}</td>
       <td class="number">${cf.format(row.detailSalesAmount)}</td>
     </tr>
-  `).join("") || emptyRow(11);
+  `).join("") || emptyRow(9);
 }
 
 function buildPeriodBranchChartData(rows, analysisPeriods, valueFor) {
@@ -1112,13 +1519,27 @@ function renderVendingDiscard(vendingMode, analysisPeriods) {
 
   const rowsWithDiscard = [...state.filteredRows]
     .map((row) => {
-      const discardByPeriod = Object.fromEntries((row.monthlyHistory || [])
-        .filter((month) => selectedSet.has(month.period))
+      const selectedHistory = (row.monthlyHistory || []).filter((month) => selectedSet.has(month.period));
+      const discardByPeriod = Object.fromEntries(selectedHistory
         .map((month) => [month.period, Number(month.discard) || 0]));
       const selectedDiscardTotal = analysisPeriods.reduce((total, period) => total + (discardByPeriod[period] || 0), 0);
+      const discardDetails = selectedHistory.flatMap((month) => {
+        const details = Array.isArray(month.discardDetails) ? month.discardDetails : [];
+        if (details.length) {
+          return details.map((detail) => ({
+            period: month.period,
+            date: detail.date || "",
+            qty: Number(detail.qty) || 0,
+            amount: Number(detail.amount) || ((Number(detail.qty) || 0) * row.price),
+          }));
+        }
+        const qty = Number(month.discard) || 0;
+        return qty ? [{ period: month.period, date: "", qty, amount: qty * row.price }] : [];
+      });
       return {
         ...row,
         discardByPeriod,
+        discardDetails,
         selectedDiscardTotal,
         selectedDiscardAmount: selectedDiscardTotal * row.price,
       };
@@ -1130,53 +1551,51 @@ function renderVendingDiscard(vendingMode, analysisPeriods) {
   renderVendingDiscardChart(chartData);
 
   const detailRows = rowsWithDiscard
-    .map((row) => {
-      const detailQty = state.discardSelection.period ? (row.discardByPeriod[state.discardSelection.period] || 0) : row.selectedDiscardTotal;
-      return {
+    .flatMap((row) => row.discardDetails
+      .filter((detail) => !state.discardSelection.period || detail.period === state.discardSelection.period)
+      .map((detail) => ({
         ...row,
-        detailDiscardQty: detailQty,
-        detailDiscardAmount: detailQty * row.price,
-      };
-    })
+        detailDate: detail.date || "",
+        detailPeriod: detail.period,
+        detailDiscardQty: detail.qty,
+        detailDiscardAmount: detail.amount,
+      })))
     .filter((row) => row.detailDiscardQty > 0)
     .filter((row) => !state.discardSelection.branch || row.branch === state.discardSelection.branch)
-    .sort((a, b) => b.detailDiscardAmount - a.detailDiscardAmount || b.detailDiscardQty - a.detailDiscardQty || a.code.localeCompare(b.code, "ko"));
+    .sort((a, b) => {
+      const dateCompare = (a.detailDate || `${a.detailPeriod}-99`).localeCompare(b.detailDate || `${b.detailPeriod}-99`);
+      return dateCompare || a.branch.localeCompare(b.branch, "ko") || a.code.localeCompare(b.code, "ko");
+    });
 
-  const selectedTitle = [
-    state.discardSelection.branch,
-    state.discardSelection.period ? formatPeriodLabel(state.discardSelection.period) : null,
-  ].filter(Boolean).join(" / ");
   $("vendingDiscardHeaderRow").innerHTML = `
-    <th>구분</th>
+    <th>날짜</th>
     <th>지점</th>
     <th>품번</th>
     <th>품명</th>
     <th>규격</th>
     <th>단위</th>
-    <th class="number">현재고</th>
     <th class="number">폐기 수량</th>
-    <th class="number">구매단가</th>
-    <th class="number">폐기 금액</th>
+    <th class="number">구매 단가</th>
+    <th class="number">폐기금액</th>
   `;
-  $("vendingDiscardDetailTitle").textContent = selectedTitle ? `자판기 폐기 세부내역 (${selectedTitle})` : "자판기 폐기 세부내역";
-  $("vendingDiscardBasis").textContent = selectedTitle
-    ? `${selectedTitle} 조건에 해당하는 폐기만 표시합니다. 폐기 금액은 구매단가 기준입니다.`
-    : `${describePeriodRange(analysisPeriods)} 전체 폐기 합계입니다. 그래프의 월/지점 셀을 클릭하면 세부내역이 좁혀집니다.`;
+  const discardTitlePeriod = state.discardSelection.period ? formatPeriodLabel(state.discardSelection.period) : describePeriodRange(analysisPeriods);
+  $("vendingDiscardDetailTitle").textContent = `자판기 폐기 세부내역 (${discardTitlePeriod})`;
+  $("vendingDiscardBasis").textContent = "";
+  $("vendingDiscardBasis").classList.add("hidden");
   $("vendingDiscardCount").textContent = `${nf.format(detailRows.length)}건 / 총 ${nf.format(sum(detailRows, "detailDiscardQty"))} EA / ${cf.format(sum(detailRows, "detailDiscardAmount"))}`;
   $("vendingDiscardBody").innerHTML = detailRows.slice(0, 350).map((row) => `
     <tr>
-      <td>${typePill(row)}</td>
+      <td>${escapeHtml(formatDiscardDetailDateLabel(row.detailDate))}</td>
       <td>${escapeHtml(row.branch)}</td>
       <td>${escapeHtml(row.code)}</td>
       <td>${escapeHtml(row.category)}</td>
       <td>${escapeHtml(row.spec)}</td>
       <td>${escapeHtml(row.unit || "EA")}</td>
-      <td class="number">${escapeHtml(qtyText(row, row.stock))}</td>
       <td class="number">${escapeHtml(qtyText(row, row.detailDiscardQty))}</td>
       <td class="number">${cf.format(row.price)}</td>
       <td class="number">${cf.format(row.detailDiscardAmount)}</td>
     </tr>
-  `).join("") || emptyRow(10);
+  `).join("") || emptyRow(9);
 }
 
 function buildDiscardChartData(rows, analysisPeriods) {
@@ -1375,82 +1794,146 @@ function renderVendingDiscardPie({ branches, cellValues, period }) {
 }
 
 function renderPurchase() {
-  const vendingMode = $("datasetFilter").value === "vending";
-  const aggregateByCode = vendingMode && $("branchFilter").value === "전체";
-  const rows = purchaseRows(vendingMode, aggregateByCode).sort(vendingMode
-    ? (a, b) => a.code.localeCompare(b.code, "ko") || a.branch.localeCompare(b.branch, "ko")
-    : (a, b) => b.purchaseAmount - a.purchaseAmount || b.purchaseQty - a.purchaseQty);
-  $("purchaseBranchHeader").textContent = aggregateByCode ? "필요 지점" : "지점";
+  const rows = purchaseRows().sort((a, b) =>
+    b.purchaseAmount - a.purchaseAmount || b.purchaseQty - a.purchaseQty || b.monthlyAverage - a.monthlyAverage || a.code.localeCompare(b.code, "ko"));
+  const totalQty = sum(rows, "purchaseQty");
+  const totalAmount = sum(rows, "purchaseAmount");
+  $("purchaseSummary").innerHTML = `
+    <div class="purchase-summary-card">
+      <span>구매 필요 품목</span>
+      <strong>${nf.format(rows.length)}품목</strong>
+    </div>
+    <div class="purchase-summary-card">
+      <span>구매필요 수량</span>
+      <strong>${nf.format(totalQty)} EA</strong>
+    </div>
+    <div class="purchase-summary-card">
+      <span>예상비용</span>
+      <strong>${cf.format(totalAmount)}</strong>
+    </div>
+  `;
+  $("purchaseExportHint").textContent = `모든 지점 기말재고와 창고 기말재고를 합산해 계산한 구매필요 품목을 엑셀로 저장합니다.`;
   $("purchaseBody").innerHTML = rows.slice(0, 350).map((row) => `
     <tr>
-      <td>${typePill(row)}</td>
-      <td>${escapeHtml(row.branch)}</td>
       <td>${escapeHtml(row.code)}</td>
       <td>${escapeHtml(row.category)}</td>
       <td>${escapeHtml(row.spec)}</td>
       <td>${escapeHtml(row.unit || "EA")}</td>
-      <td class="number">${escapeHtml(qtyText(row, row.stock))}</td>
-      ${vendingMode ? "" : `<td class="number">${escapeHtml(qtyText(row, row.monthlyConsume))}</td>`}
-      <td class="number">${escapeHtml(qtyText(row, row.planningMonthlyConsume, df))}</td>
-      ${vendingMode ? `<td class="number">${escapeHtml(qtyText(row, row.avgMonthlyDiscard, df))}</td>` : ""}
-      <td>${escapeHtml(row.planningBasis)}</td>
-      <td class="number">${escapeHtml(qtyText(row, row.recommendedStock))}</td>
+      <td class="number">${escapeHtml(qtyText(row, row.monthlyAverage, df))}</td>
+      <td class="number">${escapeHtml(qtyText(row, row.targetStock))}</td>
+      <td class="number">${escapeHtml(qtyText(row, row.branchStock))}</td>
+      <td class="number">${escapeHtml(qtyText(row, row.warehouseStock || 0))}</td>
+      <td class="number">${escapeHtml(qtyText(row, row.totalStock))}</td>
       <td class="number">${escapeHtml(qtyText(row, row.purchaseQty))}</td>
       <td class="number">${cf.format(row.price)}</td>
       <td class="number">${cf.format(row.purchaseAmount)}</td>
     </tr>
-  `).join("") || emptyRow(14);
+  `).join("") || emptyRow(12);
 }
 
-function purchaseRows(vendingMode, aggregateByCode) {
-  const rows = state.filteredRows.filter((row) => row.purchaseQty > 0);
-  if (!vendingMode || !aggregateByCode) return rows;
+function purchaseRows() {
+  const dataset = $("datasetFilter").value;
+  const query = $("searchInput").value.trim().toLowerCase();
+  const safetyMonths = Math.max(1, toNumber($("safetyMonths").value) || 2);
+  const analysisPeriods = selectedAnalysisPeriods(dataset);
   const map = new Map();
-  rows.forEach((row) => {
-    const target = map.get(row.code) || {
+  state.rows
+    .filter((row) => dataset === "all" || row.sourceId === dataset)
+    .map(applyBranchSettings)
+    .filter(Boolean)
+    .filter((row) => !isExcludedFromVendingPlan(row, analysisPeriods))
+    .filter((row) => {
+      if (!query) return true;
+      return [row.code, row.category, row.spec, row.purposeGroup, row.branch, row.sourceLabel].join(" ").toLowerCase().includes(query);
+    })
+    .map((row) => withPurchase(row, safetyMonths, 2, analysisPeriods))
+    .forEach((row) => {
+      const key = `${row.sourceId}||${row.code}`;
+      const target = map.get(key) || {
       ...row,
-      branch: "",
-      branchCount: 0,
-      stock: 0,
+      branchStock: 0,
+      monthlyAverage: 0,
       planningMonthlyConsume: 0,
-      avgMonthlyDiscard: 0,
-      recommendedStock: 0,
-      purchaseQty: 0,
+      branchCount: 0,
+      targetStock: 0,
+      warehouseStock: warehouseStockFor(row),
+      totalStock: 0,
       purchaseAmount: 0,
     };
-    target.branchCount += 1;
-    target.stock += row.stock;
-    target.planningMonthlyConsume += row.planningMonthlyConsume;
-    target.avgMonthlyDiscard += row.avgMonthlyDiscard || 0;
-    target.recommendedStock += row.recommendedStock;
-    target.purchaseQty += row.purchaseQty;
-    target.purchaseAmount += row.purchaseAmount;
-    map.set(row.code, target);
-  });
-  return Array.from(map.values()).map((row) => ({
-    ...row,
-    branch: `${nf.format(row.branchCount)}개 지점`,
-  }));
+      target.branchCount += 1;
+      target.branchStock += row.stock;
+      target.planningMonthlyConsume += row.planningMonthlyConsume;
+      map.set(key, target);
+    });
+  return Array.from(map.values()).map((row) => {
+    const monthlyAverage = row.planningMonthlyConsume;
+    const targetStock = Math.ceil(monthlyAverage * safetyMonths);
+    const totalStock = row.branchStock + row.warehouseStock;
+    const purchaseQty = Math.max(0, targetStock - totalStock);
+    return {
+      ...row,
+      monthlyAverage,
+      targetStock,
+      totalStock,
+      purchaseQty,
+      purchaseAmount: purchaseQty * row.price,
+    };
+  }).filter((row) => row.purchaseQty > 0);
 }
 
 function renderDelivery() {
-  const rows = state.filteredRows.filter((row) => row.deliveryQty > 0).sort((a, b) => a.code.localeCompare(b.code, "ko") || a.branch.localeCompare(b.branch, "ko"));
-  $("deliveryBody").innerHTML = rows.map((row) => `
+  const deliveryWeeks = Math.max(1, toNumber($("deliveryWeeks").value) || 2);
+  const analysisPeriods = selectedAnalysisPeriods("vending");
+  const rows = state.filteredRows
+    .filter((row) => !isExcludedFromVendingPlan(row, analysisPeriods))
+    .filter((row) => row.deliveryQty > 0)
+    .sort((a, b) => a.branch.localeCompare(b.branch, "ko") || b.deliveryQty - a.deliveryQty || a.code.localeCompare(b.code, "ko"));
+  const branchGroups = groupByBranch(rows);
+  const selectedBranch = $("branchFilter").value || "전체";
+  const totalQty = rows.reduce((total, row) => total + row.deliveryQty, 0);
+
+  $("deliverySummary").innerHTML = `
+    <div class="delivery-summary-card">
+      <span>배송 대상 지점</span>
+      <strong>${nf.format(branchGroups.length)}곳</strong>
+    </div>
+    <div class="delivery-summary-card">
+      <span>배송 필요 품목</span>
+      <strong>${nf.format(rows.length)}품목</strong>
+    </div>
+    <div class="delivery-summary-card">
+      <span>총 배송 수량</span>
+      <strong>${nf.format(totalQty)} EA</strong>
+    </div>
+  `;
+
+  $("deliveryTargetHeader").textContent = `${nf.format(deliveryWeeks)}주 목표`;
+  $("deliveryExportHint").textContent = selectedBranch !== "전체"
+    ? `${selectedBranch} 배송 필요 품목을 엑셀로 저장합니다.`
+    : "현재 표시 중인 배송 필요 품목을 엑셀로 저장합니다.";
+
+  $("deliveryBody").innerHTML = rows.slice(0, 350).map((row) => `
     <tr>
-      <td>${typePill(row)}</td>
       <td>${escapeHtml(row.branch)}</td>
       <td>${escapeHtml(row.code)}</td>
       <td>${escapeHtml(row.category)}</td>
       <td>${escapeHtml(row.spec)}</td>
       <td>${escapeHtml(row.unit || "EA")}</td>
-      <td class="number">${escapeHtml(qtyText(row, row.stock))}</td>
-      <td class="number">${escapeHtml(qtyText(row, row.monthlyConsume))}</td>
+      <td class="number">${escapeHtml(qtyText(row, row.deliveryMonthlySales, df))}</td>
       <td class="number">${escapeHtml(qtyText(row, row.deliveryTargetStock))}</td>
-      <td class="number">${escapeHtml(qtyText(row, row.deliveryQty))}</td>
-      <td class="number">${cf.format(row.price)}</td>
-      <td class="number">${cf.format(row.deliveryAmount)}</td>
+      <td class="number">${stockCell(row)}</td>
+      <td class="number delivery-qty">${escapeHtml(qtyText(row, row.deliveryQty))}</td>
     </tr>
-  `).join("") || emptyRow(12);
+  `).join("") || emptyRow(9);
+}
+
+function groupByBranch(rows) {
+  const map = new Map();
+  rows.forEach((row) => {
+    if (!map.has(row.branch)) map.set(row.branch, []);
+    map.get(row.branch).push(row);
+  });
+  return Array.from(map.entries()).map(([branch, groupRows]) => ({ branch, rows: groupRows }));
 }
 
 function renderVendingOtherHistory(vendingMode, branch, query, analysisPeriods) {
@@ -1461,6 +1944,8 @@ function renderVendingOtherHistory(vendingMode, branch, query, analysisPeriods) 
   const selectedSet = new Set(selectedPeriods);
   if (!selectedSet.has(state.otherSelection.period)) state.otherSelection.period = null;
   const rows = (state.history.vendingOtherRows || [])
+    .map(applyBranchSettings)
+    .filter(Boolean)
     .filter((row) => branch === "전체" || row.branch === branch)
     .filter((row) => !query || [row.branch, row.code, row.category, row.spec].join(" ").toLowerCase().includes(query))
     .map((row) => {
@@ -1497,13 +1982,35 @@ function renderVendingOtherHistory(vendingMode, branch, query, analysisPeriods) 
   }
 
   const detailRows = rows
-    .map((row) => {
+    .flatMap((row) => {
+      const details = Array.isArray(row.otherDetails) ? row.otherDetails : [];
+      if (details.length) {
+        return details
+          .filter((detail) => selectedSet.has(detail.period))
+          .filter((detail) => !state.otherSelection.period || detail.period === state.otherSelection.period)
+          .map((detail) => ({
+            ...row,
+            detailDate: detail.date || "",
+            detailPeriod: detail.period,
+            detailOtherQty: Number(detail.qty) || 0,
+            detailOtherAmount: Number(detail.amount) || ((Number(detail.qty) || 0) * (row.price || 0)),
+          }));
+      }
       const detailQty = state.otherSelection.period ? (row.otherByPeriod?.[state.otherSelection.period] || 0) : row.selectedTotal;
-      return { ...row, detailOtherQty: detailQty, detailOtherAmount: detailQty * (row.price || 0) };
+      return [{
+        ...row,
+        detailDate: "",
+        detailPeriod: state.otherSelection.period || "",
+        detailOtherQty: detailQty,
+        detailOtherAmount: detailQty * (row.price || 0),
+      }];
     })
     .filter((row) => row.detailOtherQty > 0)
     .filter((row) => !state.otherSelection.branch || row.branch === state.otherSelection.branch)
-    .sort((a, b) => b.detailOtherAmount - a.detailOtherAmount || b.detailOtherQty - a.detailOtherQty || a.branch.localeCompare(b.branch, "ko") || a.code.localeCompare(b.code, "ko"));
+    .sort((a, b) => {
+      const dateCompare = (a.detailDate || `${a.detailPeriod}-99`).localeCompare(b.detailDate || `${b.detailPeriod}-99`);
+      return dateCompare || a.branch.localeCompare(b.branch, "ko") || a.code.localeCompare(b.code, "ko");
+    });
   const selectedTitle = [
     state.otherSelection.branch,
     state.otherSelection.period ? formatPeriodLabel(state.otherSelection.period) : null,
@@ -1512,7 +2019,7 @@ function renderVendingOtherHistory(vendingMode, branch, query, analysisPeriods) 
   $("vendingOtherBasis").textContent = selectedTitle
     ? `${selectedTitle} 조건에 해당하는 기타 입력을 구매단가 기준 금액으로 표시합니다. 품목 행을 클릭하면 메모를 남길 수 있습니다.`
     : `${describeSelectedHistory("자판기 상품", selectedPeriods)} 원본 시트의 기타 입력을 구매단가 기준 금액으로 표시합니다. 월 점을 클릭하면 지점별 비율이 원그래프로 표시됩니다.`;
-  $("vendingOtherTotalHeader").textContent = state.otherSelection.period ? "기타 수량" : `${selectedPeriods.length}개월 기타 합계`;
+  $("vendingOtherTotalHeader").textContent = "수량";
   $("vendingOtherCount").textContent = `총 ${nf.format(sum(detailRows, "detailOtherQty"))} EA / ${cf.format(sum(detailRows, "detailOtherAmount"))} / ${nf.format(detailRows.length)}품목`;
   $("vendingOtherBody").innerHTML = detailRows.map((row) => {
     const noteKey = otherNoteKey(row);
@@ -1520,21 +2027,18 @@ function renderVendingOtherHistory(vendingMode, branch, query, analysisPeriods) 
     const label = `${row.branch} / ${row.code} / ${row.category}`;
     return `
     <tr class="${state.activeOtherNote?.key === noteKey ? "selected-row" : ""}">
+      <td>${escapeHtml(formatDiscardDetailDateLabel(row.detailDate))}</td>
       <td>${escapeHtml(row.branch)}</td>
       <td>${escapeHtml(row.code)}</td>
       <td>${escapeHtml(row.category)}</td>
       <td>${escapeHtml(row.spec)}</td>
       <td>${escapeHtml(row.unit || "EA")}</td>
-      <td class="number">${nf.format(row.selectedMonthCount)}</td>
       <td class="number">${escapeHtml(qtyText(row, row.detailOtherQty))}</td>
       <td class="number">${cf.format(row.price || 0)}</td>
-      <td class="number">${cf.format(row.detailOtherAmount)}</td>
-      <td class="number">${escapeHtml(qtyText(row, row.selectedAverage, df))}</td>
-      <td class="memo-text">${escapeHtml(note || "메모 없음")}</td>
-      <td><button class="memo-button" data-other-note-key="${escapeHtml(noteKey)}" data-other-note-label="${escapeHtml(label)}" type="button">${note ? "수정" : "작성"}</button></td>
+      <td class="memo-text memo-clickable" data-other-note-key="${escapeHtml(noteKey)}" data-other-note-label="${escapeHtml(label)}" tabindex="0" role="button">${escapeHtml(note || "메모 없음")}</td>
     </tr>
   `;
-  }).join("") || emptyRow(12);
+  }).join("") || emptyRow(9);
 }
 
 function setVendingHeaders(vendingMode, consumableMode, analysisMonths, safetyMonths) {
@@ -1546,13 +2050,9 @@ function setVendingHeaders(vendingMode, consumableMode, analysisMonths, safetyMo
   $("overviewOtherHeader").classList.add("hidden");
   $("overviewPriceHeader").textContent = vendingMode ? "구매단가" : "단가";
   $("overviewSalePriceHeader").classList.toggle("hidden", !vendingMode);
-  $("purchaseConsumeHeader").classList.toggle("hidden", vendingMode);
-  $("purchaseConsumeHeader").textContent = "당월 소모";
-  $("purchasePlanningHeader").textContent = vendingMode ? `${analysisMonths}개월 평균 판매` : consumableMode ? `${analysisMonths}개월 평균 월소모` : "추천 기준 월평균";
-  $("purchaseDiscardHeader").textContent = `${analysisMonths}개월 평균 폐기`;
-  $("purchaseDiscardHeader").classList.toggle("hidden", !vendingMode);
-  $("purchaseTargetHeader").textContent = vendingMode ? "목표 보유" : consumableMode ? `${safetyMonths}개월 예상 소모량` : "권장 보유";
-  $("purchaseQtyHeader").textContent = vendingMode || consumableMode ? "구매필요" : "구매 추천";
+  $("purchasePlanningHeader").textContent = vendingMode ? "월 평균 판매" : consumableMode ? "월 평균 소모" : "월 평균 판매/소모";
+  $("purchaseTargetHeader").textContent = `${safetyMonths}개월 안전재고 목표`;
+  $("purchaseQtyHeader").textContent = "구매필요";
   $("overviewAmountHeader").textContent = vendingMode ? "당월 매출" : "소모 금액";
   $("exceptionConsumeHeader").textContent = vendingMode ? "당월 판매" : "월 소모";
 }
@@ -1578,10 +2078,71 @@ function resetOverviewHeader() {
 
 function renderAmount() {
   const vendingMode = $("datasetFilter").value === "vending";
+  $("vendingDashboard").classList.toggle("hidden", !vendingMode);
+  $("legacyAmountAnalysis").classList.toggle("hidden", vendingMode);
+  if (vendingMode) {
+    renderVendingDashboard();
+    return;
+  }
   renderCategoryAmounts();
   const discardRows = [...state.filteredRows].filter((row) => row.discardAmount > 0).sort((a, b) => b.discardAmount - a.discardAmount).slice(0, 10);
-  const emptyText = vendingMode ? "폐기 금액 데이터가 없습니다." : "이동 금액 데이터가 없습니다.";
-  $("discardAmountList").innerHTML = discardRows.map((row, index) => rankRow(index, `${row.category} / ${row.branch}`, row.spec, cf.format(row.discardAmount))).join("") || `<div class="empty">${emptyText}</div>`;
+  $("discardAmountList").innerHTML = discardRows.map((row, index) => rankRow(index, row.category + " / " + row.branch, row.spec, cf.format(row.discardAmount))).join("") || '<div class="empty">?? ?? ???? ????.</div>';
+}
+
+function renderVendingDashboard() {
+  const rows = state.filteredRows.filter((row) => row.sourceId === "vending");
+  const salesAmount = sum(rows, "salesAmount");
+  const discardAmount = sum(rows, "discardAmount");
+  const otherAmount = rows.reduce((total, row) => total + vendingOtherAmount(row), 0);
+  $("dashboardSummary").innerHTML = [
+    dashboardCard("\uB2F9\uC6D4 \uB9E4\uCD9C", cf.format(salesAmount)),
+    dashboardCard("\uB2F9\uC6D4 \uD3D0\uAE30\uAE08\uC561", cf.format(discardAmount), "warning"),
+    dashboardCard("\uB2F9\uC6D4 \uAE30\uD0C0\uAE08\uC561", cf.format(otherAmount), otherAmount > 0 ? "warning" : ""),
+  ].join("");
+
+  const branchRows = Array.from(groupVendingDashboardByBranch(rows).values())
+    .sort((a, b) => b.salesAmount - a.salesAmount || b.discardAmount - a.discardAmount || a.branch.localeCompare(b.branch, "ko"));
+  $("dashboardBranchBody").innerHTML = branchRows.map((row) => {
+    const flags = [];
+    if (row.discardAmount > 0) flags.push("\uD3D0\uAE30");
+    if (row.otherAmount > 0) flags.push("\uAE30\uD0C0");
+    return '\n      <tr>\n        <td><strong>' + escapeHtml(row.branch) + '</strong></td>\n        <td class="number">' + cf.format(row.salesAmount) + '</td>\n        <td class="number">' + cf.format(row.discardAmount) + '</td>\n        <td class="number">' + cf.format(row.otherAmount) + '</td>\n        <td>' + (flags.length ? flags.map((flag) => '<span class="dashboard-flag">' + flag + '</span>').join("") : "-") + '</td>\n      </tr>\n    ';
+  }).join("") || emptyRow(5);
+
+  renderDashboardTop("dashboardSalesTop", rows, "salesAmount", (row) => row.monthlyConsume, "\uB9E4\uCD9C \uB370\uC774\uD130\uAC00 \uC5C6\uC2B5\uB2C8\uB2E4.");
+  renderDashboardTop("dashboardDiscardTop", rows, "discardAmount", (row) => row.monthlyDiscard, "\uD3D0\uAE30 \uB370\uC774\uD130\uAC00 \uC5C6\uC2B5\uB2C8\uB2E4.");
+  renderDashboardTop("dashboardOtherTop", rows.map((row) => ({ ...row, otherAmount: vendingOtherAmount(row) })), "otherAmount", (row) => row.monthlyOther, "\uAE30\uD0C0 \uB370\uC774\uD130\uAC00 \uC5C6\uC2B5\uB2C8\uB2E4.");
+}
+
+function dashboardCard(label, value, tone = "") {
+  return '<article class="dashboard-card ' + escapeHtml(tone) + '"><span>' + escapeHtml(label) + '</span><strong>' + escapeHtml(value) + '</strong></article>';
+}
+
+function groupVendingDashboardByBranch(rows) {
+  const map = new Map();
+  rows.forEach((row) => {
+    const target = map.get(row.branch) || { branch: row.branch, salesAmount: 0, discardAmount: 0, otherAmount: 0 };
+    target.salesAmount += row.salesAmount || 0;
+    target.discardAmount += row.discardAmount || 0;
+    target.otherAmount += vendingOtherAmount(row);
+    map.set(row.branch, target);
+  });
+  return map;
+}
+
+function vendingOtherAmount(row) {
+  return (Number(row.monthlyOther) || 0) * (Number(row.price) || 0);
+}
+
+function renderDashboardTop(targetId, rows, valueKey, qtyFor, emptyText) {
+  const ranked = [...rows]
+    .filter((row) => (Number(row[valueKey]) || 0) > 0)
+    .sort((a, b) => (Number(b[valueKey]) || 0) - (Number(a[valueKey]) || 0) || a.code.localeCompare(b.code, "ko"))
+    .slice(0, 10);
+  $(targetId).innerHTML = ranked.map((row, index) => {
+    const qty = qtyText(row, qtyFor(row));
+    return rankRow(index, row.category + " / " + row.branch, row.code + " / " + row.spec + " / " + qty, cf.format(row[valueKey]));
+  }).join("") || '<div class="empty">' + escapeHtml(emptyText) + '</div>';
 }
 
 function renderPurpose(forecastMonths, analysisPeriods) {
@@ -1655,7 +2216,7 @@ function renderExceptions() {
       <td>${escapeHtml(row.category)}</td>
       <td>${escapeHtml(row.spec)}</td>
       <td>${escapeHtml(row.unit || "EA")}</td>
-      <td class="number">${escapeHtml(qtyText(row, row.stock))}</td>
+      <td class="number">${stockCell(row)}</td>
       <td class="number">${escapeHtml(qtyText(row, row.monthlyConsume))}</td>
       <td class="number">${cf.format(row.price)}</td>
     </tr>
@@ -1710,71 +2271,235 @@ function rankRow(index, title, subtitle, value) {
   `;
 }
 
-function exportPurchaseCsv() {
-  const vendingMode = $("datasetFilter").value === "vending";
-  const analysisMonths = selectedAnalysisPeriods($("datasetFilter").value).length;
+function exportPurchaseXlsx() {
+  const dataset = $("datasetFilter").value;
   const safetyMonths = Math.max(1, toNumber($("safetyMonths").value) || 2);
-  const aggregateByCode = vendingMode && $("branchFilter").value === "전체";
-  const rows = purchaseRows(vendingMode, aggregateByCode);
-  const header = vendingMode
-    ? ["구분", aggregateByCode ? "필요지점" : "지점", "품번", "품명", "규격", "단위", "현재고", `${analysisMonths}개월평균판매`, `${analysisMonths}개월평균폐기`, "계산기준", "목표보유", "구매필요", "단가", "예상금액"]
-    : $("datasetFilter").value === "consumable"
-      ? ["구분", "지점", "품번", "품명", "규격", "단위", "현재고", "당월소모", `${analysisMonths}개월평균월소모`, "계산기준", `${safetyMonths}개월예상소모량`, "구매필요", "단가", "예상금액"]
-      : ["구분", "지점", "품번", "품명", "규격", "단위", "현재고", "당월소모", "추천기준월평균", "계산기준", "권장보유", "구매추천", "단가", "예상금액"];
-  const csv = [header, ...rows.map((row) => [
-    row.sourceLabel,
-    row.branch,
+  const rows = purchaseRows().sort((a, b) =>
+    b.purchaseAmount - a.purchaseAmount || b.purchaseQty - a.purchaseQty || b.monthlyAverage - a.monthlyAverage || a.code.localeCompare(b.code, "ko"));
+  const header = ["품번", "품명", "규격", "단위", "월 평균 판매", `${safetyMonths}개월 안전재고 목표`, "모든 지점 기말재고", "창고 기말재고", "총 보유", "구매필요", "단가", "예상비용"];
+  const sheetRows = [header, ...rows.map((row) => [
     row.code,
     row.category,
     row.spec,
     row.unit || "EA",
-    row.stock,
-    ...(vendingMode ? [] : [row.monthlyConsume]),
-    row.planningMonthlyConsume,
-    ...(vendingMode ? [row.avgMonthlyDiscard] : []),
-    row.planningBasis,
-    row.recommendedStock,
+    row.monthlyAverage,
+    row.targetStock,
+    row.branchStock,
+    row.warehouseStock || 0,
+    row.totalStock,
     row.purchaseQty,
     row.price,
     row.purchaseAmount,
-  ])].map((line) => line.map(csvCell).join(",")).join("\n");
-  const blob = new Blob(["\ufeff", csv], { type: "text/csv;charset=utf-8" });
-  const link = document.createElement("a");
-  link.href = URL.createObjectURL(blob);
-  link.download = vendingMode ? "자판기_구매필요.csv" : $("datasetFilter").value === "consumable" ? "경상소모품_구매필요.csv" : "구매추천.csv";
-  link.click();
-  URL.revokeObjectURL(link.href);
+  ])];
+  const baseName = dataset === "vending" ? "자판기_구매필요" : dataset === "consumable" ? "경상소모품_구매필요" : "구매필요";
+  const filename = `${baseName}.xlsx`;
+  downloadXlsx(filename, "구매필요", sheetRows);
 }
 
-function exportDeliveryCsv() {
+function exportDeliveryXlsx() {
+  const selectedBranch = $("branchFilter").value || "전체";
   const rows = state.filteredRows.filter((row) => row.deliveryQty > 0);
-  const header = ["구분", "지점", "품번", "품명", "규격", "단위", "현재고", "당월판매", "배송주기(주)", "주당판매환산", "배송주기목표재고", "배송필요", "단가", "예상금액"];
-  const csv = [header, ...rows.map((row) => [
-    row.sourceLabel,
+  const deliveryWeeks = Math.max(1, toNumber($("deliveryWeeks").value) || 2);
+  const header = ["지점", "품번", "품명", "규격", "단위", "월 평균 판매", `${deliveryWeeks}주 목표`, "지점 기말재고", "보낼 수량"];
+  const sheetRows = [header, ...rows.map((row) => [
     row.branch,
     row.code,
     row.category,
     row.spec,
     row.unit || "EA",
-    row.stock,
-    row.monthlyConsume,
-    row.deliveryWeeks,
-    row.deliveryWeeklySales,
+    row.deliveryMonthlySales,
     row.deliveryTargetStock,
+    row.stock,
     row.deliveryQty,
-    row.price,
-    row.deliveryAmount,
-  ])].map((line) => line.map(csvCell).join(",")).join("\n");
-  const blob = new Blob(["\ufeff", csv], { type: "text/csv;charset=utf-8" });
-  const link = document.createElement("a");
-  link.href = URL.createObjectURL(blob);
-  link.download = "자판기_배송계획.csv";
-  link.click();
-  URL.revokeObjectURL(link.href);
+  ])];
+  const filename = selectedBranch !== "전체" ? `자판기_${selectedBranch}_배송계획.xlsx` : "자판기_배송계획.xlsx";
+  downloadXlsx(filename, "배송계획", sheetRows);
 }
 
 function csvCell(value) {
   return `"${String(value ?? "").replaceAll('"', '""')}"`;
+}
+
+function downloadXlsx(filename, sheetName, rows) {
+  const files = xlsxFiles(sheetName, rows);
+  const zipBytes = createZip(files);
+  const blob = new Blob([zipBytes], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(link.href);
+}
+
+function xlsxFiles(sheetName, rows) {
+  const sheetXml = worksheetXml(rows);
+  const workbookSheetName = escapeXml(sheetName.slice(0, 31) || "Sheet1");
+  return [
+    {
+      name: "[Content_Types].xml",
+      content: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>`,
+    },
+    {
+      name: "_rels/.rels",
+      content: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>`,
+    },
+    {
+      name: "xl/workbook.xml",
+      content: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+    <sheet name="${workbookSheetName}" sheetId="1" r:id="rId1"/>
+  </sheets>
+</workbook>`,
+    },
+    {
+      name: "xl/_rels/workbook.xml.rels",
+      content: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>`,
+    },
+    { name: "xl/worksheets/sheet1.xml", content: sheetXml },
+  ];
+}
+
+function worksheetXml(rows) {
+  const columnCount = Math.max(1, ...rows.map((row) => row.length));
+  const columnWidths = Array.from({ length: columnCount }, (_, index) => {
+    const width = Math.min(42, Math.max(10, ...rows.map((row) => String(row[index] ?? "").length + 2)));
+    return `<col min="${index + 1}" max="${index + 1}" width="${width}" customWidth="1"/>`;
+  }).join("");
+  const rowXml = rows.map((row, rowIndex) => `
+    <row r="${rowIndex + 1}">
+      ${row.map((value, colIndex) => worksheetCellXml(value, rowIndex + 1, colIndex + 1)).join("")}
+    </row>`).join("");
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <cols>${columnWidths}</cols>
+  <sheetData>${rowXml}
+  </sheetData>
+</worksheet>`;
+}
+
+function worksheetCellXml(value, rowNumber, columnNumber) {
+  const ref = `${columnName(columnNumber)}${rowNumber}`;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return `<c r="${ref}"><v>${value}</v></c>`;
+  }
+  return `<c r="${ref}" t="inlineStr"><is><t>${escapeXml(value ?? "")}</t></is></c>`;
+}
+
+function columnName(number) {
+  let name = "";
+  let current = number;
+  while (current > 0) {
+    const remainder = (current - 1) % 26;
+    name = String.fromCharCode(65 + remainder) + name;
+    current = Math.floor((current - 1) / 26);
+  }
+  return name;
+}
+
+function escapeXml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+function createZip(files) {
+  const encoder = new TextEncoder();
+  const localParts = [];
+  const centralParts = [];
+  let offset = 0;
+  files.forEach((file) => {
+    const nameBytes = encoder.encode(file.name);
+    const contentBytes = encoder.encode(file.content);
+    const crc = crc32(contentBytes);
+    const localHeader = zipLocalHeader(nameBytes, contentBytes, crc);
+    localParts.push(localHeader, contentBytes);
+    centralParts.push(zipCentralHeader(nameBytes, contentBytes, crc, offset));
+    offset += localHeader.length + contentBytes.length;
+  });
+  const centralSize = centralParts.reduce((total, part) => total + part.length, 0);
+  const end = zipEndRecord(files.length, centralSize, offset);
+  return concatUint8([...localParts, ...centralParts, end]);
+}
+
+function zipLocalHeader(nameBytes, contentBytes, crc) {
+  const header = new Uint8Array(30 + nameBytes.length);
+  const view = new DataView(header.buffer);
+  view.setUint32(0, 0x04034b50, true);
+  view.setUint16(4, 20, true);
+  view.setUint16(6, 0, true);
+  view.setUint16(8, 0, true);
+  view.setUint32(14, crc, true);
+  view.setUint32(18, contentBytes.length, true);
+  view.setUint32(22, contentBytes.length, true);
+  view.setUint16(26, nameBytes.length, true);
+  header.set(nameBytes, 30);
+  return header;
+}
+
+function zipCentralHeader(nameBytes, contentBytes, crc, offset) {
+  const header = new Uint8Array(46 + nameBytes.length);
+  const view = new DataView(header.buffer);
+  view.setUint32(0, 0x02014b50, true);
+  view.setUint16(4, 20, true);
+  view.setUint16(6, 20, true);
+  view.setUint16(8, 0, true);
+  view.setUint16(10, 0, true);
+  view.setUint32(16, crc, true);
+  view.setUint32(20, contentBytes.length, true);
+  view.setUint32(24, contentBytes.length, true);
+  view.setUint16(28, nameBytes.length, true);
+  view.setUint32(42, offset, true);
+  header.set(nameBytes, 46);
+  return header;
+}
+
+function zipEndRecord(fileCount, centralSize, centralOffset) {
+  const header = new Uint8Array(22);
+  const view = new DataView(header.buffer);
+  view.setUint32(0, 0x06054b50, true);
+  view.setUint16(8, fileCount, true);
+  view.setUint16(10, fileCount, true);
+  view.setUint32(12, centralSize, true);
+  view.setUint32(16, centralOffset, true);
+  return header;
+}
+
+function concatUint8(parts) {
+  const totalLength = parts.reduce((total, part) => total + part.length, 0);
+  const output = new Uint8Array(totalLength);
+  let offset = 0;
+  parts.forEach((part) => {
+    output.set(part, offset);
+    offset += part.length;
+  });
+  return output;
+}
+
+function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (let index = 0; index < bytes.length; index += 1) {
+    crc ^= bytes[index];
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
 }
 
 function typePill(row) {
