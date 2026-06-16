@@ -29,12 +29,18 @@ const state = {
   filteredRows: [],
   branches: [],
   history: {},
+  dataAsOf: {},
+  generatedAt: "",
   warehouse: { bySourceCode: {}, basisLabel: "" },
   currentStockBasis: {},
   lastDataStatus: "",
   activeTab: "overview",
   discardSelection: { period: null, branch: null },
   salesSelection: { period: null, branch: null },
+  dashboardSelection: { period: null, branch: null },
+  dashboardMetric: "sales",
+  profitPeriod: null,
+  profitSelection: { period: null },
   otherSelection: { period: null, branch: null },
   otherNotes: loadOtherNotes(),
   appSettings: loadAppSettings(),
@@ -46,7 +52,7 @@ const state = {
 const $ = (id) => document.getElementById(id);
 const nf = new Intl.NumberFormat("ko-KR");
 const df = new Intl.NumberFormat("ko-KR", { maximumFractionDigits: 1 });
-const cf = new Intl.NumberFormat("ko-KR", { style: "currency", currency: "KRW", maximumFractionDigits: 0 });
+const cf = new Intl.NumberFormat("ko-KR", { maximumFractionDigits: 0 });
 
 function qtyText(row, value, formatter = nf) {
   return `${formatter.format(Number(value) || 0)} ${row.unit || "EA"}`;
@@ -82,6 +88,7 @@ function defaultAppSettings() {
     branchRenames: {},
     branchHidden: [],
     vendingExclusions: [],
+    targetMargin: 0.4,
   };
 }
 
@@ -95,6 +102,7 @@ function loadAppSettings() {
       branchRenames: parsed.branchRenames && typeof parsed.branchRenames === "object" ? parsed.branchRenames : {},
       branchHidden: Array.isArray(parsed.branchHidden) ? parsed.branchHidden : [],
       vendingExclusions: Array.isArray(parsed.vendingExclusions) ? parsed.vendingExclusions : [],
+      targetMargin: Number.isFinite(Number(parsed.targetMargin)) ? Math.min(0.9, Math.max(0, Number(parsed.targetMargin))) : 0.4,
     };
   } catch {
     return defaultAppSettings();
@@ -259,6 +267,11 @@ document.addEventListener("DOMContentLoaded", () => {
 function bindEvents() {
   $("reloadButton").addEventListener("click", loadSnapshot);
   $("datasetFilter").addEventListener("change", () => {
+    if ($("datasetFilter").value === "vending") {
+      state.activeTab = "amount";
+      document.querySelectorAll(".tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === state.activeTab));
+      document.querySelectorAll(".tab-page").forEach((page) => page.classList.toggle("active", page.id === state.activeTab));
+    }
     fillBranchFilter();
     render();
   });
@@ -305,6 +318,51 @@ function bindEvents() {
       branch: button.getAttribute("data-sales-branch") || null,
     };
     render();
+  });
+  $("dashboardBranchTrendChart").addEventListener("click", (event) => {
+    const branchButton = event.target.closest("[data-dashboard-select-branch]");
+    if (branchButton) {
+      state.dashboardSelection = {
+        period: state.dashboardSelection.period || vendingCurrentPeriod(),
+        branch: branchButton.getAttribute("data-dashboard-select-branch") || null,
+      };
+      render();
+      return;
+    }
+    const monthArea = event.target.closest("[data-dashboard-select-period]");
+    if (!monthArea) return;
+    state.dashboardSelection = {
+      period: monthArea.getAttribute("data-dashboard-select-period") || null,
+      branch: state.dashboardSelection.branch,
+    };
+    render();
+  });
+  document.querySelectorAll("[data-dashboard-metric]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.dashboardMetric = button.getAttribute("data-dashboard-metric") || "sales";
+      render();
+    });
+  });
+  $("productMarginMonthChart").addEventListener("click", (event) => {
+    const period = event.target.getAttribute?.("data-profit-period") || event.target.closest?.("[data-profit-period]")?.getAttribute("data-profit-period");
+    if (!period) return;
+    state.profitSelection.period = period;
+    renderProfit();
+  });
+  $("clearProfitSelection").addEventListener("click", () => {
+    state.profitSelection = { period: null };
+    renderProfit();
+  });
+  const applyTargetMargin = () => {
+    const value = Math.min(90, Math.max(0, Number($("targetMarginInput").value) || 0));
+    state.appSettings.targetMargin = value / 100;
+    $("targetMarginInput").value = String(value);
+    saveAppSettings();
+    renderProfit();
+  };
+  $("applyTargetMargin")?.addEventListener("click", applyTargetMargin);
+  $("targetMarginInput")?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") applyTargetMargin();
   });
   $("vendingOtherMonthChart").addEventListener("click", (event) => {
     const button = event.target.closest("[data-other-period]");
@@ -517,6 +575,8 @@ function applyPayload(payload, sourceLabel) {
   }
     state.rows = Array.isArray(payload.rows) ? payload.rows : [];
     state.history = payload.history || {};
+    state.dataAsOf = payload.dataAsOf || {};
+    state.generatedAt = payload.generatedAt || "";
     state.warehouse = normalizeWarehousePayload(payload.warehouse);
     state.currentStockBasis = payload.currentStockBasis || {};
     if (payload.sourceMode === "google-sheets-live") normalizeLiveRows();
@@ -585,23 +645,14 @@ function warehouseStockFor(row) {
 }
 
 function originalBranchesForDataset(dataset) {
+  if (dataset === "all") {
+    return Array.from(new Set(state.rows.map((row) => row.branch))).sort((a, b) => a.localeCompare(b, "ko"));
+  }
   return Array.from(new Set(state.rows.filter((row) => row.sourceId === dataset).map((row) => row.branch))).sort((a, b) => a.localeCompare(b, "ko"));
 }
 
-function branchDisplayName(branch) {
-  return branch;
-}
-
-function branchSourceName(displayName) {
-  return displayName;
-}
-
-function isBranchHidden(branch) {
-  return false;
-}
-
 function effectiveBranchesForDataset(dataset) {
-  return ["\uC804\uCCB4", ...originalBranchesForDataset(dataset)];
+  return ["전체", ...originalBranchesForDataset(dataset)];
 }
 
 function applyBranchSettings(row) {
@@ -972,7 +1023,7 @@ function aggregateRows(rows) {
 
 function fillBranchFilter() {
   const dataset = $("datasetFilter")?.value || "consumable";
-  const branches = dataset === "all" ? state.branches : effectiveBranchesForDataset(dataset);
+  const branches = effectiveBranchesForDataset(dataset);
   const current = $("branchFilter").value || "전체";
   $("branchFilter").innerHTML = branches.map((branch) => `<option value="${escapeHtml(branch)}">${escapeHtml(branch)}</option>`).join("");
   $("branchFilter").value = branches.includes(current) ? current : branches[0];
@@ -983,6 +1034,11 @@ function render() {
   const vendingMode = dataset === "vending";
   const consumableMode = dataset === "consumable";
   if (!vendingMode && ["delivery", "discard", "other"].includes(state.activeTab)) {
+    state.activeTab = "overview";
+    document.querySelectorAll(".tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === state.activeTab));
+    document.querySelectorAll(".tab-page").forEach((page) => page.classList.toggle("active", page.id === state.activeTab));
+  }
+  if (!vendingMode && state.activeTab === "profit") {
     state.activeTab = "overview";
     document.querySelectorAll(".tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === state.activeTab));
     document.querySelectorAll(".tab-page").forEach((page) => page.classList.toggle("active", page.id === state.activeTab));
@@ -1004,7 +1060,9 @@ function render() {
   $("deliveryTab").classList.toggle("hidden", !vendingMode);
   $("discardTab").classList.toggle("hidden", !vendingMode);
   $("otherTab").classList.toggle("hidden", !vendingMode);
+  $("profitTab").classList.toggle("hidden", !vendingMode);
   $("purposeTab").classList.toggle("hidden", !consumableMode);
+  $("exceptionsTab").classList.toggle("hidden", vendingMode);
   $("purchaseTab").textContent = vendingMode || consumableMode ? "구매필요" : "구매 추천";
   $("overviewTab").textContent = vendingMode ? "판매" : "현황";
   $("consumeMetricLabel").textContent = vendingMode ? "당월 판매 수량" : consumableMode ? "당월 소모 수량" : "월 소모/판매 수량";
@@ -1037,6 +1095,7 @@ function render() {
   renderDelivery();
   renderPurchase();
   renderAmount();
+  renderProfit();
   renderPurpose(safetyMonths, analysisPeriods);
   renderExceptions();
 }
@@ -1065,7 +1124,10 @@ function renderVendingSettingsPanel() {
     <div id="exclusionPanel" class="exclusion-modal ${state.exclusionPanelOpen ? "" : "hidden"}" role="dialog" aria-modal="true" aria-label="&#54032;&#47588; &#51228;&#50808; &#47785;&#47197;">
       <article class="vending-settings-card">
         <div class="settings-card-title exclusion-modal-title">
-          <h3>&#54032;&#47588; &#51228;&#50808; &#47785;&#47197;</h3>
+          <div>
+            <h3>자판기 상품 판매 제외</h3>
+            <p>지점 목록은 구글시트 기준으로 자동 반영됩니다.</p>
+          </div>
           <button id="closeExclusionPanel" type="button" class="secondary">&#45803;&#44592;</button>
         </div>
         <div class="settings-input-grid exclusion-settings-inputs">
@@ -1269,26 +1331,32 @@ function renderOverview(analysisPeriods) {
 }
 
 function renderVendingSales(analysisPeriods) {
-  const selectedSet = new Set(analysisPeriods);
+  const displayPeriods = vendingDisplayPeriods(analysisPeriods);
+  const selectedSet = new Set(displayPeriods);
   if (!selectedSet.has(state.salesSelection.period)) state.salesSelection.period = null;
   const availableBranches = new Set(state.filteredRows.map((row) => row.branch));
   if (state.salesSelection.branch && !availableBranches.has(state.salesSelection.branch)) state.salesSelection.branch = null;
 
   const rowsWithSales = [...state.filteredRows]
     .map((row) => {
-      const salesByPeriod = Object.fromEntries((row.monthlyHistory || [])
-        .filter((month) => selectedSet.has(month.period))
-        .map((month) => [month.period, {
-          qty: Number(month.consume) || 0,
-          amount: Number(month.salesAmount) || 0,
-        }]));
-      const selectedSalesQty = analysisPeriods.reduce((total, period) => total + (salesByPeriod[period]?.qty || 0), 0);
-      const selectedSalesAmount = analysisPeriods.reduce((total, period) => total + (salesByPeriod[period]?.amount || 0), 0);
-      return { ...row, salesByPeriod, selectedSalesQty, selectedSalesAmount };
+      const salesByPeriod = Object.fromEntries(displayPeriods.map((period) => {
+        const values = dashboardPeriodValues(row, period);
+        return [period, {
+          qty: values.salesQty,
+          amount: values.salesAmount,
+          cost: values.salesCost,
+          purchaseUnit: values.salesQty ? values.salesCost / values.salesQty : (Number(row.price) || 0),
+          saleUnit: values.salesQty ? values.salesAmount / values.salesQty : (Number(row.salePrice) || 0),
+        }];
+      }));
+      const selectedSalesQty = displayPeriods.reduce((total, period) => total + (salesByPeriod[period]?.qty || 0), 0);
+      const selectedSalesAmount = displayPeriods.reduce((total, period) => total + (salesByPeriod[period]?.amount || 0), 0);
+      const selectedSalesCost = displayPeriods.reduce((total, period) => total + (salesByPeriod[period]?.cost || 0), 0);
+      return { ...row, salesByPeriod, selectedSalesQty, selectedSalesAmount, selectedSalesCost };
     })
     .filter((row) => row.selectedSalesQty > 0 || row.selectedSalesAmount > 0);
 
-  const chartData = buildPeriodBranchChartData(rowsWithSales, analysisPeriods, (row, period) => row.salesByPeriod[period]?.amount || 0);
+  const chartData = buildPeriodBranchChartData(rowsWithSales, displayPeriods, (row, period) => row.salesByPeriod[period]?.amount || 0);
   renderPeriodLineChart("vendingSalesMonthChart", chartData, {
     selection: state.salesSelection,
     dataPrefix: "sales",
@@ -1316,7 +1384,10 @@ function renderVendingSales(analysisPeriods) {
     .map((row) => {
       const detailQty = state.salesSelection.period ? (row.salesByPeriod[state.salesSelection.period]?.qty || 0) : row.selectedSalesQty;
       const detailAmount = state.salesSelection.period ? (row.salesByPeriod[state.salesSelection.period]?.amount || 0) : row.selectedSalesAmount;
-      return { ...row, detailSalesQty: detailQty, detailSalesAmount: detailAmount };
+      const detailCost = state.salesSelection.period ? (row.salesByPeriod[state.salesSelection.period]?.cost || 0) : row.selectedSalesCost;
+      const detailPurchasePrice = detailQty ? detailCost / detailQty : (Number(row.price) || 0);
+      const detailSalePrice = detailQty ? detailAmount / detailQty : (Number(row.salePrice) || 0);
+      return { ...row, detailSalesQty: detailQty, detailSalesAmount: detailAmount, detailPurchasePrice, detailSalePrice };
     })
     .filter((row) => row.detailSalesQty > 0 || row.detailSalesAmount > 0)
     .filter((row) => !state.salesSelection.branch || row.branch === state.salesSelection.branch)
@@ -1347,15 +1418,15 @@ function renderVendingSales(analysisPeriods) {
       <td>${escapeHtml(row.spec)}</td>
       <td>${escapeHtml(row.unit || "EA")}</td>
       <td class="number">${escapeHtml(qtyText(row, row.detailSalesQty))}</td>
-      <td class="number">${cf.format(row.price)}</td>
-      <td class="number">${cf.format(row.salePrice || 0)}</td>
+      <td class="number">${cf.format(row.detailPurchasePrice)}</td>
+      <td class="number">${cf.format(row.detailSalePrice)}</td>
       <td class="number">${cf.format(row.detailSalesAmount)}</td>
     </tr>
   `).join("") || emptyRow(9);
 }
 
 function buildPeriodBranchChartData(rows, analysisPeriods, valueFor) {
-  const branches = Array.from(new Set(rows.map((row) => row.branch))).sort((a, b) => a.localeCompare(b, "ko"));
+  const branches = visibleVendingBranches(rows);
   const cellValues = new Map();
   branches.forEach((branch) => {
     analysisPeriods.forEach((period) => {
@@ -1395,7 +1466,7 @@ function renderPeriodLineChart(targetId, { analysisPeriods, monthTotals }, { sel
       <line class="chart-axis" x1="${pad.left}" y1="${pad.top + plotHeight}" x2="${width - pad.right}" y2="${pad.top + plotHeight}"></line>
       <line class="chart-axis" x1="${pad.left}" y1="${pad.top}" x2="${pad.left}" y2="${pad.top + plotHeight}"></line>
       <text class="chart-y-label" x="${pad.left - 10}" y="${pad.top + 4}">${escapeHtml(formatValue(max))}</text>
-      <text class="chart-y-label" x="${pad.left - 10}" y="${pad.top + plotHeight + 4}">₩0</text>
+      <text class="chart-y-label" x="${pad.left - 10}" y="${pad.top + plotHeight + 4}">0</text>
       <path class="chart-area" d="${areaPath}"></path>
       <path class="chart-line" d="${linePath}"></path>
       ${points.map((point) => {
@@ -1512,18 +1583,25 @@ function renderPeriodPieChart(targetId, { branches, cellValues }, { selection, d
 
 function renderVendingDiscard(vendingMode, analysisPeriods) {
   if (!vendingMode) return;
-  const selectedSet = new Set(analysisPeriods);
+  const displayPeriods = vendingDisplayPeriods(analysisPeriods);
+  const selectedSet = new Set(displayPeriods);
   if (!selectedSet.has(state.discardSelection.period)) state.discardSelection.period = null;
   const availableBranches = new Set(state.filteredRows.map((row) => row.branch));
   if (state.discardSelection.branch && !availableBranches.has(state.discardSelection.branch)) state.discardSelection.branch = null;
 
   const rowsWithDiscard = [...state.filteredRows]
     .map((row) => {
-      const selectedHistory = (row.monthlyHistory || []).filter((month) => selectedSet.has(month.period));
-      const discardByPeriod = Object.fromEntries(selectedHistory
-        .map((month) => [month.period, Number(month.discard) || 0]));
-      const selectedDiscardTotal = analysisPeriods.reduce((total, period) => total + (discardByPeriod[period] || 0), 0);
-      const discardDetails = selectedHistory.flatMap((month) => {
+      const discardByPeriod = Object.fromEntries(displayPeriods.map((period) => [period, dashboardPeriodValues(row, period).lossQty - (period === vendingCurrentPeriod() ? (Number(row.monthlyOther) || 0) : (Number((row.monthlyHistory || []).find((month) => month.period === period)?.other) || 0))]));
+      const selectedDiscardTotal = displayPeriods.reduce((total, period) => total + (discardByPeriod[period] || 0), 0);
+      const discardDetails = displayPeriods.flatMap((period) => {
+        if (period === vendingCurrentPeriod()) {
+          const qty = Number(row.monthlyDiscard) || 0;
+          const unitPrice = periodPurchaseUnit(row, period);
+          const amount = Number(row.discardAmount) || qty * unitPrice;
+          return qty ? [{ period, date: "", qty, amount, unitPrice }] : [];
+        }
+        const month = (row.monthlyHistory || []).find((item) => item.period === period);
+        if (!month) return [];
         const details = Array.isArray(month.discardDetails) ? month.discardDetails : [];
         if (details.length) {
           return details.map((detail) => ({
@@ -1531,22 +1609,29 @@ function renderVendingDiscard(vendingMode, analysisPeriods) {
             date: detail.date || "",
             qty: Number(detail.qty) || 0,
             amount: Number(detail.amount) || ((Number(detail.qty) || 0) * row.price),
+            unitPrice: (Number(detail.qty) || 0) ? (Number(detail.amount) || 0) / (Number(detail.qty) || 0) : periodPurchaseUnit(row, month.period),
           }));
         }
         const qty = Number(month.discard) || 0;
-        return qty ? [{ period: month.period, date: "", qty, amount: qty * row.price }] : [];
+        const unitPrice = periodPurchaseUnit(row, month.period);
+        return qty ? [{ period: month.period, date: "", qty, amount: qty * unitPrice, unitPrice }] : [];
       });
+      const discardAmountByPeriod = discardDetails.reduce((map, detail) => {
+        map[detail.period] = (map[detail.period] || 0) + (Number(detail.amount) || 0);
+        return map;
+      }, {});
       return {
         ...row,
         discardByPeriod,
+        discardAmountByPeriod,
         discardDetails,
         selectedDiscardTotal,
-        selectedDiscardAmount: selectedDiscardTotal * row.price,
+        selectedDiscardAmount: displayPeriods.reduce((total, period) => total + (discardAmountByPeriod[period] || 0), 0),
       };
     })
     .filter((row) => row.selectedDiscardTotal > 0);
 
-  const chartData = buildDiscardChartData(rowsWithDiscard, analysisPeriods);
+  const chartData = buildDiscardChartData(rowsWithDiscard, displayPeriods);
   renderVendingDiscardMonthChart(chartData);
   renderVendingDiscardChart(chartData);
 
@@ -1559,6 +1644,7 @@ function renderVendingDiscard(vendingMode, analysisPeriods) {
         detailPeriod: detail.period,
         detailDiscardQty: detail.qty,
         detailDiscardAmount: detail.amount,
+        detailPurchasePrice: detail.unitPrice || (detail.qty ? detail.amount / detail.qty : row.price),
       })))
     .filter((row) => row.detailDiscardQty > 0)
     .filter((row) => !state.discardSelection.branch || row.branch === state.discardSelection.branch)
@@ -1578,7 +1664,7 @@ function renderVendingDiscard(vendingMode, analysisPeriods) {
     <th class="number">구매 단가</th>
     <th class="number">폐기금액</th>
   `;
-  const discardTitlePeriod = state.discardSelection.period ? formatPeriodLabel(state.discardSelection.period) : describePeriodRange(analysisPeriods);
+  const discardTitlePeriod = state.discardSelection.period ? formatPeriodLabel(state.discardSelection.period) : describePeriodRange(displayPeriods);
   $("vendingDiscardDetailTitle").textContent = `자판기 폐기 세부내역 (${discardTitlePeriod})`;
   $("vendingDiscardBasis").textContent = "";
   $("vendingDiscardBasis").classList.add("hidden");
@@ -1592,20 +1678,20 @@ function renderVendingDiscard(vendingMode, analysisPeriods) {
       <td>${escapeHtml(row.spec)}</td>
       <td>${escapeHtml(row.unit || "EA")}</td>
       <td class="number">${escapeHtml(qtyText(row, row.detailDiscardQty))}</td>
-      <td class="number">${cf.format(row.price)}</td>
+      <td class="number">${cf.format(row.detailPurchasePrice)}</td>
       <td class="number">${cf.format(row.detailDiscardAmount)}</td>
     </tr>
   `).join("") || emptyRow(9);
 }
 
 function buildDiscardChartData(rows, analysisPeriods) {
-  const branches = Array.from(new Set(rows.map((row) => row.branch))).sort((a, b) => a.localeCompare(b, "ko"));
+  const branches = visibleVendingBranches(rows);
   const cellValues = new Map();
   branches.forEach((branch) => {
     analysisPeriods.forEach((period) => {
       const value = rows
         .filter((row) => row.branch === branch)
-        .reduce((total, row) => total + ((row.discardByPeriod[period] || 0) * row.price), 0);
+        .reduce((total, row) => total + (row.discardAmountByPeriod?.[period] ?? ((row.discardByPeriod[period] || 0) * row.price)), 0);
       cellValues.set(`${branch}__${period}`, value);
     });
   });
@@ -1637,7 +1723,7 @@ function renderVendingDiscardMonthChart({ analysisPeriods, monthTotals }) {
       <line class="chart-axis" x1="${pad.left}" y1="${pad.top + plotHeight}" x2="${width - pad.right}" y2="${pad.top + plotHeight}"></line>
       <line class="chart-axis" x1="${pad.left}" y1="${pad.top}" x2="${pad.left}" y2="${pad.top + plotHeight}"></line>
       <text class="chart-y-label" x="${pad.left - 10}" y="${pad.top + 4}">${escapeHtml(cf.format(max))}</text>
-      <text class="chart-y-label" x="${pad.left - 10}" y="${pad.top + plotHeight + 4}">₩0</text>
+      <text class="chart-y-label" x="${pad.left - 10}" y="${pad.top + plotHeight + 4}">0</text>
       <path class="chart-area" d="${areaPath}"></path>
       <path class="chart-line" d="${linePath}"></path>
       ${points.map((point) => {
@@ -1940,10 +2026,10 @@ function renderVendingOtherHistory(vendingMode, branch, query, analysisPeriods) 
   const panel = $("vendingOtherPanel");
   panel.classList.toggle("hidden", !vendingMode);
   if (!vendingMode) return;
-  const selectedPeriods = analysisPeriods;
+  const selectedPeriods = vendingDisplayPeriods(analysisPeriods);
   const selectedSet = new Set(selectedPeriods);
   if (!selectedSet.has(state.otherSelection.period)) state.otherSelection.period = null;
-  const rows = (state.history.vendingOtherRows || [])
+  const rows = mergeCurrentOtherRows(state.history.vendingOtherRows || [], state.filteredRows, selectedPeriods)
     .map(applyBranchSettings)
     .filter(Boolean)
     .filter((row) => branch === "전체" || row.branch === branch)
@@ -2041,6 +2127,59 @@ function renderVendingOtherHistory(vendingMode, branch, query, analysisPeriods) 
   }).join("") || emptyRow(9);
 }
 
+function vendingDisplayPeriods(analysisPeriods) {
+  const periods = new Set(analysisPeriods || []);
+  const currentPeriod = vendingCurrentPeriod();
+  if (currentPeriod) periods.add(currentPeriod);
+  return [...periods].sort();
+}
+
+function periodPurchaseUnit(row, period) {
+  const values = dashboardPeriodValues(row, period);
+  return values.salesQty ? values.salesCost / values.salesQty : (Number(row.price) || 0);
+}
+
+function mergeCurrentOtherRows(historyRows, currentRows, selectedPeriods) {
+  const currentPeriod = vendingCurrentPeriod();
+  if (!currentPeriod || !selectedPeriods.includes(currentPeriod)) return historyRows;
+  const keyFor = (row) => `${row.branch || ""}||${normalizeCode(row.code)}`;
+  const rowsByKey = new Map((historyRows || []).map((row) => [keyFor(row), {
+    ...row,
+    otherByPeriod: { ...(row.otherByPeriod || {}) },
+    otherDetails: [...(row.otherDetails || [])],
+  }]));
+  (currentRows || []).forEach((sourceRow) => {
+    const qty = Number(sourceRow.monthlyOther) || 0;
+    if (qty <= 0) return;
+    const key = keyFor(sourceRow);
+    const price = periodPurchaseUnit(sourceRow, currentPeriod);
+    const row = rowsByKey.get(key) || {
+      branch: sourceRow.branch || "",
+      code: sourceRow.code || "",
+      category: sourceRow.category || "",
+      spec: sourceRow.spec || "",
+      unit: sourceRow.unit || "",
+      price,
+      historyOtherTotal: 0,
+      otherByPeriod: {},
+      otherDetails: [],
+      avgMonthlyOther: 0,
+      otherMonths: 0,
+    };
+    row.price = price || Number(row.price) || 0;
+    row.otherByPeriod[currentPeriod] = qty;
+    row.otherDetails = (row.otherDetails || []).filter((detail) => detail.period !== currentPeriod);
+    row.otherDetails.push({
+      date: state.dataAsOf?.vending || "",
+      qty,
+      amount: qty * (row.price || 0),
+      period: currentPeriod,
+    });
+    rowsByKey.set(key, row);
+  });
+  return [...rowsByKey.values()];
+}
+
 function setVendingHeaders(vendingMode, consumableMode, analysisMonths, safetyMonths) {
   resetOverviewHeader();
   $("overviewConsumeHeader").textContent = vendingMode ? `${analysisMonths}개월 평균 판매` : "월 소모";
@@ -2092,26 +2231,763 @@ function renderAmount() {
 function renderVendingDashboard() {
   const rows = state.filteredRows.filter((row) => row.sourceId === "vending");
   const salesAmount = sum(rows, "salesAmount");
+  const salesQty = sum(rows, "monthlyConsume");
   const discardAmount = sum(rows, "discardAmount");
   const otherAmount = rows.reduce((total, row) => total + vendingOtherAmount(row), 0);
+  const lossAmount = discardAmount + otherAmount;
+  const salesCost = rows.reduce((total, row) => total + (Number(row.monthlyConsume) || 0) * (Number(row.price) || 0), 0);
+  const grossProfit = salesAmount - salesCost;
+  const adjustedProfit = salesAmount - salesCost - lossAmount;
+  const lossRate = salesAmount > 0 ? lossAmount / salesAmount : 0;
+  const deliveryQty = sum(rows, "deliveryQty");
+  const analysisPeriods = selectedAnalysisPeriods("vending");
+  const dashboardPeriods = vendingDashboardPeriods(rows);
+  const currentPeriod = vendingCurrentPeriod();
+  if (!dashboardPeriods.includes(state.dashboardSelection.period)) {
+    state.dashboardSelection = { period: dashboardPeriods.includes(currentPeriod) ? currentPeriod : dashboardPeriods.at(-1) || null, branch: null };
+  }
   $("dashboardSummary").innerHTML = [
-    dashboardCard("\uB2F9\uC6D4 \uB9E4\uCD9C", cf.format(salesAmount)),
-    dashboardCard("\uB2F9\uC6D4 \uD3D0\uAE30\uAE08\uC561", cf.format(discardAmount), "warning"),
-    dashboardCard("\uB2F9\uC6D4 \uAE30\uD0C0\uAE08\uC561", cf.format(otherAmount), otherAmount > 0 ? "warning" : ""),
+    dashboardCard("당월 매출", cf.format(salesAmount)),
+    dashboardCard("당월 수익", cf.format(grossProfit), grossProfit < 0 ? "warning" : "profit"),
+    dashboardCard("판매수량", eaText(salesQty)),
+    dashboardCard("폐기+기타 손실", cf.format(lossAmount), lossAmount > 0 ? "warning" : ""),
+    dashboardCard("총 이익", cf.format(adjustedProfit), adjustedProfit < 0 ? "warning" : "profit"),
   ].join("");
 
   const branchRows = Array.from(groupVendingDashboardByBranch(rows).values())
-    .sort((a, b) => b.salesAmount - a.salesAmount || b.discardAmount - a.discardAmount || a.branch.localeCompare(b.branch, "ko"));
+    .map((row) => ({
+      ...row,
+      lossAmount: row.discardAmount + row.otherAmount,
+      lossRate: row.salesAmount > 0 ? (row.discardAmount + row.otherAmount) / row.salesAmount : 0,
+      averageSalesAmount: averageVendingBranchSales(rows, analysisPeriods, row.branch),
+    }))
+    .sort((a, b) => b.salesAmount - a.salesAmount || b.lossAmount - a.lossAmount || b.deliveryQty - a.deliveryQty || a.branch.localeCompare(b.branch, "ko"));
+  visibleVendingBranches(rows).forEach((branch) => {
+    if (!branchRows.some((row) => row.branch === branch)) {
+      branchRows.push({ branch, salesAmount: 0, grossProfit: 0, salesQty: 0, lossAmount: 0, lossRate: 0, deliveryQty: 0, averageSalesAmount: 0 });
+    }
+  });
   $("dashboardBranchBody").innerHTML = branchRows.map((row) => {
-    const flags = [];
-    if (row.discardAmount > 0) flags.push("\uD3D0\uAE30");
-    if (row.otherAmount > 0) flags.push("\uAE30\uD0C0");
-    return '\n      <tr>\n        <td><strong>' + escapeHtml(row.branch) + '</strong></td>\n        <td class="number">' + cf.format(row.salesAmount) + '</td>\n        <td class="number">' + cf.format(row.discardAmount) + '</td>\n        <td class="number">' + cf.format(row.otherAmount) + '</td>\n        <td>' + (flags.length ? flags.map((flag) => '<span class="dashboard-flag">' + flag + '</span>').join("") : "-") + '</td>\n      </tr>\n    ';
-  }).join("") || emptyRow(5);
+    const flags = dashboardBranchFlags(row);
+    return `
+      <tr>
+        <td><strong>${escapeHtml(row.branch)}</strong></td>
+        <td class="number">${cf.format(row.salesAmount)}</td>
+        <td class="number">${cf.format(row.grossProfit)}</td>
+        <td class="number">${eaText(row.salesQty)}</td>
+        <td class="number">${cf.format(row.lossAmount)}</td>
+        <td class="number">${percentText(row.lossRate)}</td>
+        <td class="number">${eaText(row.deliveryQty)}</td>
+        <td>${flags.length ? flags.map((flag) => dashboardFlag(flag)).join("") : "-"}</td>
+      </tr>
+    `;
+  }).join("") || emptyRow(8);
 
-  renderDashboardTop("dashboardSalesTop", rows, "salesAmount", (row) => row.monthlyConsume, "\uB9E4\uCD9C \uB370\uC774\uD130\uAC00 \uC5C6\uC2B5\uB2C8\uB2E4.");
-  renderDashboardTop("dashboardDiscardTop", rows, "discardAmount", (row) => row.monthlyDiscard, "\uD3D0\uAE30 \uB370\uC774\uD130\uAC00 \uC5C6\uC2B5\uB2C8\uB2E4.");
-  renderDashboardTop("dashboardOtherTop", rows.map((row) => ({ ...row, otherAmount: vendingOtherAmount(row) })), "otherAmount", (row) => row.monthlyOther, "\uAE30\uD0C0 \uB370\uC774\uD130\uAC00 \uC5C6\uC2B5\uB2C8\uB2E4.");
+  renderDashboardBranchTrend(rows, dashboardPeriods);
+
+  const selectedRows = dashboardRowsForSelection(rows, state.dashboardSelection.period, state.dashboardSelection.branch);
+  const selectedLabel = [state.dashboardSelection.branch, state.dashboardSelection.period ? formatPeriodLabel(state.dashboardSelection.period) : null].filter(Boolean).join(" · ");
+  $("dashboardSalesTopTitle").textContent = selectedLabel ? `매출 TOP 품목 · ${selectedLabel}` : "매출 TOP 품목";
+  $("dashboardLossTopTitle").textContent = selectedLabel ? `손실 TOP 품목 · ${selectedLabel}` : "손실 TOP 품목";
+  renderDashboardTop("dashboardSalesTop", "dashboardSalesTopCount", selectedRows, "dashboardSalesAmount", (row) => row.dashboardSalesQty, "선택 조건에서 매출이 있는 품목이 없습니다.", "sales", 5);
+  renderDashboardTop("dashboardLossTop", "dashboardLossTopCount", selectedRows, "dashboardLossAmount", (row) => row.dashboardLossQty, "선택 조건에서 손실 데이터가 없습니다.", "loss");
+}
+
+function renderProfit() {
+  const vendingMode = $("datasetFilter").value === "vending";
+  if (!vendingMode) return;
+
+  const rows = state.filteredRows.filter((row) => row.sourceId === "vending");
+  const currentPeriod = vendingCurrentPeriod();
+  const selectedPeriods = selectedAnalysisPeriods("vending");
+  const periods = Array.from(new Set([...selectedPeriods, currentPeriod].filter(Boolean))).sort();
+  if (state.profitSelection.period && !periods.includes(state.profitSelection.period)) state.profitSelection.period = null;
+
+  const chartData = buildPeriodBranchChartData(rows, periods, (row, period) => dashboardPeriodValues(row, period).grossProfit);
+  renderPeriodLineChart("productMarginMonthChart", chartData, {
+    selection: { period: state.profitSelection.period, branch: null },
+    dataPrefix: "profit",
+    ariaLabel: "월별 총 상품 마진금액 그래프",
+    emptyText: "상품 마진 데이터가 없습니다.",
+  });
+  $("productMarginTrendBasis").textContent = `${describePeriodRange(periods)} · 월을 클릭하면 해당 월 상품 세부내역으로 변경됩니다.`;
+  renderProfitBranchChart(chartData, state.profitSelection.period);
+
+  const detailPeriods = state.profitSelection.period ? [state.profitSelection.period] : periods;
+  const productMap = new Map();
+  rows.filter((row) => Number(row.salePrice) > 0).forEach((row) => {
+    const key = normalizeCode(row.code) || `${row.category}__${row.spec}`;
+    const target = productMap.get(key) || {
+      code: row.code,
+      category: row.category,
+      spec: row.spec,
+      unit: row.unit || "EA",
+      price: Number(row.price) || 0,
+      salePrice: Number(row.salePrice) || 0,
+      salesQty: 0,
+      salesAmount: 0,
+      salesCost: 0,
+      grossProfit: 0,
+      sellingBranches: new Set(),
+    };
+    detailPeriods.forEach((period) => {
+      const values = dashboardPeriodValues(row, period);
+      target.salesQty += values.salesQty;
+      target.salesAmount += values.salesAmount;
+      target.salesCost += values.salesCost;
+      target.grossProfit += values.grossProfit;
+      if (values.salesQty > 0 || values.salesAmount > 0) target.sellingBranches.add(row.branch);
+    });
+    productMap.set(key, target);
+  });
+  const products = [...productMap.values()].map((row) => ({
+    ...row,
+    price: row.salesQty > 0 ? row.salesCost / row.salesQty : row.price,
+    salePrice: row.salesQty > 0 ? row.salesAmount / row.salesQty : row.salePrice,
+    unitMargin: row.salesQty > 0 ? (row.salesAmount - row.salesCost) / row.salesQty : row.salePrice - row.price,
+    periodMarginRate: ratio(row.grossProfit, row.salesAmount),
+  })).filter((row) => !state.profitSelection.period || row.salesQty > 0 || row.salesAmount > 0)
+    .sort((a, b) => b.grossProfit - a.grossProfit || b.salesAmount - a.salesAmount || a.code.localeCompare(b.code, "ko"));
+
+  const detailLabel = state.profitSelection.period ? formatPeriodLabel(state.profitSelection.period) : describePeriodRange(periods);
+  $("productMarginRateHeading").textContent = state.profitSelection.period ? `${formatPeriodLabel(state.profitSelection.period)} 마진율` : "기간 마진율";
+  $("productMarginDetailTitle").textContent = `자판기 상품별 마진 세부내역 · ${detailLabel}`;
+  $("productMarginDetailBasis").textContent = `판매가가 등록된 현재 판매 상품 ${nf.format(products.length)}개 · 모든 지점 합산 · 선택 기간 가격이력 기준`;
+  $("productMarginDetailCount").textContent = `${nf.format(products.length)}개 상품`;
+  $("productMarginDetailBody").innerHTML = products.map((row) => `
+    <tr>
+      <td><strong>${escapeHtml(row.code)}</strong></td>
+      <td>${escapeHtml(row.category)}</td>
+      <td>${escapeHtml(row.spec)}</td>
+      <td class="number">${cf.format(row.price)}</td>
+      <td class="number">${cf.format(row.salePrice)}</td>
+      <td class="number ${row.unitMargin < 0 ? "negative" : "profit-value"}">${cf.format(row.unitMargin)}</td>
+      <td class="number ${row.periodMarginRate < 0.2 ? "negative" : ""}">${percentText(row.periodMarginRate)}</td>
+      <td class="number">${escapeHtml(qtyText(row, row.salesQty))}</td>
+      <td class="number">${cf.format(row.salesAmount)}</td>
+      <td class="number"><strong>${cf.format(row.grossProfit)}</strong></td>
+      <td class="number">${nf.format(row.sellingBranches.size)}개</td>
+    </tr>
+  `).join("") || emptyRow(11);
+}
+
+function renderProfitBranchChart(chartData, selectedPeriod) {
+  $("branchMarginChartTitle").textContent = selectedPeriod
+    ? `지점별 마진 비중 · ${formatPeriodLabel(selectedPeriod)}`
+    : "지점별 월 마진금액";
+  $("branchAverageMarginBasis").textContent = selectedPeriod
+    ? "선택 월의 전체 마진금액 중 지점별 비중입니다."
+    : "월을 클릭하면 지점별 마진 비율과 금액이 원그래프로 표시됩니다.";
+
+  if (selectedPeriod) {
+    renderPeriodPieChart("branchAverageMarginChart", chartData, {
+      selection: { period: selectedPeriod, branch: null },
+      dataPrefix: "profit",
+      period: selectedPeriod,
+      label: "마진금액",
+      emptyText: "마진 데이터가 없습니다.",
+    });
+    return;
+  }
+
+  renderPeriodHeatmap("branchAverageMarginChart", chartData, {
+    selection: { period: null, branch: null },
+    dataPrefix: "profit",
+    label: "마진금액",
+    emptyText: "마진 데이터가 없습니다.",
+  });
+}
+
+function aggregateProfitValues(rows, period) {
+  return rows.reduce((result, row) => {
+    const values = dashboardPeriodValues(row, period);
+    result.salesAmount += values.salesAmount;
+    result.salesCost += values.salesCost;
+    result.grossProfit += values.grossProfit;
+    result.lossAmount += values.lossAmount;
+    result.adjustedProfit += values.adjustedProfit;
+    return result;
+  }, { salesAmount: 0, salesCost: 0, grossProfit: 0, lossAmount: 0, adjustedProfit: 0 });
+}
+
+function ratio(value, base) {
+  return base ? value / base : 0;
+}
+
+function profitProjectionFactor(period) {
+  if (period !== vendingCurrentPeriod()) return 1;
+  const basis = vendingProjectionBasis();
+  return basis?.elapsedDays ? basis.daysInMonth / basis.elapsedDays : 1;
+}
+
+function projectedAdjustedProfit(values, period) {
+  if (period !== vendingCurrentPeriod()) return values.adjustedProfit;
+  return values.grossProfit * profitProjectionFactor(period) - values.lossAmount;
+}
+
+function buildProfitComparisonRows(rows, period, previousPeriod) {
+  const projectionFactor = profitProjectionFactor(period);
+  return rows.map((row) => {
+    const current = dashboardPeriodValues(row, period);
+    const previous = previousPeriod ? dashboardPeriodValues(row, previousPeriod) : null;
+    const adjustedMargin = ratio(current.adjustedProfit, current.salesAmount);
+    const previousAdjustedMargin = previous ? ratio(previous.adjustedProfit, previous.salesAmount) : 0;
+    return {
+      ...row,
+      profitSalesAmount: current.salesAmount,
+      profitSalesQty: current.salesQty,
+      profitSalesCost: current.salesCost,
+      profitGrossProfit: current.grossProfit,
+      profitLossAmount: current.lossAmount,
+      profitAdjustedProfit: current.adjustedProfit,
+      profitGrossMargin: ratio(current.grossProfit, current.salesAmount),
+      profitAdjustedMargin: adjustedMargin,
+      previousSalesAmount: previous?.salesAmount || 0,
+      previousAdjustedProfit: previous?.adjustedProfit || 0,
+      previousAdjustedMargin,
+      marginDelta: previous && previous.salesAmount > 0 && current.salesAmount > 0 ? adjustedMargin - previousAdjustedMargin : null,
+      comparableSalesAmount: current.salesAmount * projectionFactor,
+      comparableAdjustedProfit: projectedAdjustedProfit(current, period),
+      profitChange: previous ? projectedAdjustedProfit(current, period) - previous.adjustedProfit : null,
+    };
+  });
+}
+
+function marginKpiCard(label, value, detail, tone = "") {
+  return `<article class="margin-kpi ${escapeHtml(tone)}"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong><small>${escapeHtml(detail)}</small></article>`;
+}
+
+function signedPointText(value) {
+  const points = (Number(value) || 0) * 100;
+  return `${points > 0 ? "+" : ""}${df.format(points)}%p`;
+}
+
+function signedPercentText(value) {
+  const percent = (Number(value) || 0) * 100;
+  return `${percent > 0 ? "+" : ""}${df.format(percent)}%`;
+}
+
+function renderProfitSignals({ marginDelta, projectedChange, lossImpact, adjustedMargin, projectedMargin, profitRows, previousPeriod, targetMargin, targetProfitGap }) {
+  const profitDeclines = profitRows.filter((row) => row.profitChange !== null && row.profitChange < 0);
+  const lowMargin = profitRows.filter((row) => row.profitSalesAmount > 0 && row.profitAdjustedMargin < 0.2);
+  const lossHeavy = profitRows.filter((row) => ratio(row.profitLossAmount, row.profitSalesAmount) >= 0.1);
+  const invalidPrices = profitRows.filter((row) => (row.profitSalesAmount > 0 || row.previousSalesAmount > 0) && (!(Number(row.price) > 0) || !(Number(row.salePrice) > 0)));
+  const signals = [];
+  if (projectedMargin < targetMargin) signals.push({ tone: "danger", title: "월말 목표 마진 미달", value: cf.format(targetProfitGap), detail: `${percentText(targetMargin)} 목표까지 필요한 추가 이익입니다.` });
+  if (previousPeriod && marginDelta <= -0.03) signals.push({ tone: "danger", title: "전체 마진 하락", value: signedPointText(marginDelta), detail: "전월 대비 손실 반영 마진율이 3%p 이상 하락했습니다." });
+  if (previousPeriod && projectedChange <= -0.15) signals.push({ tone: "danger", title: "예상 이익 감소", value: signedPercentText(projectedChange), detail: "월말 예상 이익이 전월보다 15% 이상 낮습니다." });
+  if (lossImpact >= 0.1) signals.push({ tone: "danger", title: "손실 영향 과다", value: `${df.format(lossImpact * 100)}%p`, detail: "폐기·기타 손실이 매출의 10% 이상을 차감하고 있습니다." });
+  if (profitDeclines.length) {
+    const declineAmount = profitDeclines.reduce((total, row) => total + row.profitChange, 0);
+    signals.push({ tone: "warning", title: "이익 감소 기여", value: cf.format(declineAmount), detail: `${nf.format(profitDeclines.length)}개 품목의 전월 대비 예상 이익 감소 합계입니다.` });
+  }
+  if (lowMargin.length) signals.push({ tone: "warning", title: "저마진·적자 품목", value: `${nf.format(lowMargin.length)}개`, detail: "손실 반영 마진율이 20% 미만인 판매 품목입니다." });
+  if (lossHeavy.length) signals.push({ tone: "warning", title: "손실 집중 품목", value: `${nf.format(lossHeavy.length)}개`, detail: "품목 손실이 해당 품목 매출의 10% 이상입니다." });
+  if (invalidPrices.length) signals.push({ tone: "danger", title: "단가 데이터 확인", value: `${nf.format(invalidPrices.length)}개`, detail: "판매 또는 구매단가가 없어 마진 계산을 확인해야 합니다." });
+  if (!signals.length) signals.push({ tone: "normal", title: "주요 악화 신호 없음", value: percentText(adjustedMargin), detail: "현재 설정된 변화 감지 기준을 벗어난 항목이 없습니다." });
+  $("profitSignalList").innerHTML = signals.map((signal) => `
+    <div class="margin-signal ${escapeHtml(signal.tone)}">
+      <div><strong>${escapeHtml(signal.title)}</strong><span>${escapeHtml(signal.detail)}</span></div>
+      <b>${escapeHtml(signal.value)}</b>
+    </div>
+  `).join("");
+}
+
+function renderMarginBridge(current, previous, period, previousPeriod) {
+  if (!previous || !previousPeriod) {
+    $("marginBridgeBasis").textContent = "비교할 이전 월이 없습니다.";
+    $("marginBridge").innerHTML = '<div class="empty">마진 변화 원인을 계산하려면 이전 월 데이터가 필요합니다.</div>';
+    return;
+  }
+  const previousGrossMargin = ratio(previous.grossProfit, previous.salesAmount);
+  const previousLossImpact = ratio(previous.lossAmount, previous.salesAmount);
+  const previousAdjustedMargin = ratio(previous.adjustedProfit, previous.salesAmount);
+  const currentGrossMargin = ratio(current.grossProfit, current.salesAmount);
+  const currentLossImpact = ratio(current.lossAmount, current.salesAmount);
+  const currentAdjustedMargin = ratio(current.adjustedProfit, current.salesAmount);
+  const mixEffect = currentGrossMargin - previousGrossMargin;
+  const lossEffect = -(currentLossImpact - previousLossImpact);
+  const totalDelta = currentAdjustedMargin - previousAdjustedMargin;
+  $("marginBridgeBasis").textContent = `${formatPeriodLabel(previousPeriod)} → ${formatPeriodLabel(period)} · 현재 구매단가 기준`;
+  const steps = [
+    { label: "전월 손실 반영 마진", value: previousAdjustedMargin, display: percentText(previousAdjustedMargin), tone: "base", detail: `총이익률 ${percentText(previousGrossMargin)}` },
+    { label: "판매 구성 영향", value: mixEffect, display: signedPointText(mixEffect), tone: mixEffect < 0 ? "down" : "up", detail: "품목별 매출 비중 변화" },
+    { label: "손실 영향 변화", value: lossEffect, display: signedPointText(lossEffect), tone: lossEffect < 0 ? "down" : "up", detail: `${df.format(previousLossImpact * 100)}%p → ${df.format(currentLossImpact * 100)}%p` },
+    { label: "현재 손실 반영 마진", value: currentAdjustedMargin, display: percentText(currentAdjustedMargin), tone: currentAdjustedMargin < 0.2 ? "down" : "result", detail: `전체 변화 ${signedPointText(totalDelta)}` },
+  ];
+  $("marginBridge").innerHTML = steps.map((step, index) => `
+    ${index ? '<span class="margin-bridge-arrow" aria-hidden="true">→</span>' : ""}
+    <div class="margin-bridge-step ${escapeHtml(step.tone)}">
+      <span>${escapeHtml(step.label)}</span>
+      <strong>${escapeHtml(step.display)}</strong>
+      <small>${escapeHtml(step.detail)}</small>
+    </div>
+  `).join("");
+}
+
+function renderMarginScenarios(totals, period, targetMargin) {
+  const factor = profitProjectionFactor(period);
+  const projectedSales = totals.salesAmount * factor;
+  const projectedGrossProfit = totals.grossProfit * factor;
+  const scenarios = [
+    { label: "현재 예상", loss: totals.lossAmount, detail: "확정 손실 유지", tone: "base" },
+    { label: "손실 50% 절감", loss: totals.lossAmount * 0.5, detail: `이익 +${cf.format(totals.lossAmount * 0.5)}`, tone: "improve" },
+    { label: "손실 전부 제거", loss: 0, detail: `이익 +${cf.format(totals.lossAmount)}`, tone: "best" },
+  ].map((scenario) => {
+    const profit = projectedGrossProfit - scenario.loss;
+    return { ...scenario, profit, margin: ratio(profit, projectedSales) };
+  });
+  const targetProfit = projectedSales * targetMargin;
+  const currentProfit = scenarios[0].profit;
+  const targetGap = Math.max(0, targetProfit - currentProfit);
+  scenarios.push({
+    label: "목표 마진 달성",
+    profit: Math.max(currentProfit, targetProfit),
+    margin: Math.max(ratio(currentProfit, projectedSales), targetMargin),
+    detail: targetGap > 0 ? `추가 이익 ${cf.format(targetGap)} 필요` : "현재 예상으로 달성",
+    tone: targetGap > 0 ? "target" : "best",
+  });
+  $("marginScenarioList").innerHTML = scenarios.map((scenario) => `
+    <div class="margin-scenario ${escapeHtml(scenario.tone)}">
+      <span>${escapeHtml(scenario.label)}</span>
+      <strong>${percentText(scenario.margin)}</strong>
+      <b>${cf.format(scenario.profit)}</b>
+      <small>${escapeHtml(scenario.detail)}</small>
+    </div>
+  `).join("");
+}
+
+function renderProfitMonthly(rows, periods, selectedPeriod, targetMargin) {
+  const monthly = periods.map((period) => {
+    const values = aggregateProfitValues(rows, period);
+    return {
+      ...values,
+      period,
+      grossMargin: ratio(values.grossProfit, values.salesAmount),
+      adjustedMargin: ratio(values.adjustedProfit, values.salesAmount),
+      comparableProfit: projectedAdjustedProfit(values, period),
+    };
+  });
+  const currentPeriod = vendingCurrentPeriod();
+  const selected = monthly.find((item) => item.period === selectedPeriod);
+  $("profitPeriodBasis").textContent = `${formatPeriodLabel(selectedPeriod)} 선택${selectedPeriod === currentPeriod ? " · 당월 예상은 현재 판매 속도 연장·확정 손실 유지" : ""} · 과거 월 판매원가는 현재 등록 구매단가 기준입니다.`;
+  if (!monthly.length) {
+    $("profitMonthlyList").innerHTML = '<div class="empty">표시할 월별 수익 데이터가 없습니다.</div>';
+    return;
+  }
+
+  const width = Math.max(920, 100 + monthly.length * 78);
+  const height = 350;
+  const pad = { top: 30, right: 82, bottom: 56, left: 68 };
+  const plotWidth = width - pad.left - pad.right;
+  const plotHeight = height - pad.top - pad.bottom;
+  const maximumMargin = Math.max(0.1, targetMargin, ...monthly.flatMap((item) => [item.grossMargin, item.adjustedMargin])) * 1.15;
+  const maximumProfit = Math.max(1, ...monthly.map((item) => Math.max(0, item.comparableProfit)));
+  const xFor = (index) => pad.left + (monthly.length === 1 ? plotWidth / 2 : plotWidth * index / (monthly.length - 1));
+  const marginY = (value) => pad.top + plotHeight - value / maximumMargin * plotHeight;
+  const profitY = (value) => pad.top + plotHeight - Math.max(0, value) / maximumProfit * plotHeight;
+  const series = [
+    { key: "grossMargin", label: "매출총이익률", color: "#4f87bd" },
+    { key: "adjustedMargin", label: "손실 반영 마진율", color: "#16806f" },
+  ];
+  const marginTicks = [maximumMargin, maximumMargin / 2, 0];
+  const barWidth = Math.min(34, Math.max(14, plotWidth / monthly.length * 0.38));
+
+  $("profitMonthlyList").innerHTML = `
+    <div class="profit-chart-scroll">
+      <svg class="profit-trend-svg" viewBox="0 0 ${width} ${height}" style="min-width:${width}px" role="img" aria-label="월별 마진율과 손실 반영 이익 변화">
+        ${marginTicks.map((value) => `
+          <line class="profit-grid-line" x1="${pad.left}" y1="${marginY(value)}" x2="${width - pad.right}" y2="${marginY(value)}"></line>
+          <text class="chart-y-label" x="${pad.left - 10}" y="${marginY(value) + 4}">${escapeHtml(percentText(value))}</text>
+        `).join("")}
+        <text class="profit-axis-label left" x="${pad.left}" y="16">마진율</text>
+        <text class="profit-axis-label right" x="${width - pad.right}" y="16">손실 반영 이익</text>
+        <line class="profit-target-line" x1="${pad.left}" y1="${marginY(targetMargin)}" x2="${width - pad.right}" y2="${marginY(targetMargin)}"></line>
+        <text class="profit-target-label" x="${pad.left + 6}" y="${marginY(targetMargin) - 6}">목표 ${escapeHtml(percentText(targetMargin))}</text>
+        <text class="chart-y-label profit-right-label" x="${width - pad.right + 70}" y="${pad.top + 4}">${escapeHtml(cf.format(maximumProfit))}</text>
+        <text class="chart-y-label profit-right-label" x="${width - pad.right + 70}" y="${pad.top + plotHeight + 4}">0</text>
+        ${monthly.map((item, index) => {
+          const left = index === 0 ? pad.left : (xFor(index - 1) + xFor(index)) / 2;
+          const right = index === monthly.length - 1 ? width - pad.right : (xFor(index) + xFor(index + 1)) / 2;
+          return `<rect class="profit-month-hit ${item.period === selectedPeriod ? "active" : ""}" x="${left}" y="${pad.top}" width="${right - left}" height="${plotHeight}" data-profit-period="${escapeHtml(item.period)}"><title>${escapeHtml(formatPeriodLabel(item.period))} 선택</title></rect>`;
+        }).join("")}
+        ${monthly.map((item, index) => {
+          const y = profitY(item.comparableProfit);
+          return `<rect class="profit-value-bar ${item.period === selectedPeriod ? "active" : ""}" x="${xFor(index) - barWidth / 2}" y="${y}" width="${barWidth}" height="${Math.max(0, pad.top + plotHeight - y)}"><title>${escapeHtml(`${formatPeriodLabel(item.period)} · ${item.period === currentPeriod ? "월말 예상 " : ""}손실 반영 이익 ${cf.format(item.comparableProfit)}`)}</title></rect>`;
+        }).join("")}
+        ${series.map((line) => {
+          const points = monthly.map((item, index) => ({ x: xFor(index), y: marginY(item[line.key]), value: item[line.key], period: item.period }));
+          const path = points.map((point, index) => `${index ? "L" : "M"} ${point.x.toFixed(1)} ${point.y.toFixed(1)}`).join(" ");
+          return `
+            <path class="profit-series-line" d="${path}" style="stroke:${line.color}"></path>
+            ${points.map((point) => `<circle class="profit-series-point ${point.period === selectedPeriod ? "active" : ""}" cx="${point.x}" cy="${point.y}" r="${point.period === selectedPeriod ? 5.5 : 3.5}" style="fill:${line.color}"><title>${escapeHtml(`${line.label} · ${formatPeriodLabel(point.period)} · ${percentText(point.value)}`)}</title></circle>`).join("")}
+          `;
+        }).join("")}
+        ${monthly.map((item, index) => `<text class="chart-x-label" x="${xFor(index)}" y="${height - 18}">${escapeHtml(formatPeriodShort(item.period))}${item.period === currentPeriod ? "*" : ""}</text>`).join("")}
+      </svg>
+    </div>
+    <div class="profit-chart-footer">
+      <div class="profit-chart-legend">
+        ${series.map((line) => `<span><i style="background:${line.color}"></i>${escapeHtml(line.label)}</span>`).join("")}
+        <span><i class="profit-legend-bar"></i>손실 반영 이익</span>
+        <span><i class="profit-legend-target"></i>목표 마진</span>
+        <span class="profit-current-note">* 진행 월</span>
+      </div>
+      ${selected ? `
+        <div class="profit-selected-metrics">
+          <span>총이익률 <strong>${percentText(selected.grossMargin)}</strong></span>
+          <span>손실 반영 마진 <strong>${percentText(selected.adjustedMargin)}</strong></span>
+          <span>손실 영향 <strong>${signedPointText(-ratio(selected.lossAmount, selected.salesAmount))}</strong></span>
+          <span>${selected.period === currentPeriod ? "월말 예상 이익" : "손실 반영 이익"}<strong class="${selected.comparableProfit < 0 ? "negative" : ""}">${cf.format(selected.comparableProfit)}</strong></span>
+        </div>
+      ` : ""}
+    </div>
+  `;
+}
+
+function buildBranchProfitRows(rows, period, previousPeriod) {
+  const branches = visibleVendingBranches(rows);
+  return branches.map((branch) => {
+    const branchItems = rows.filter((row) => row.branch === branch);
+    const current = aggregateProfitValues(branchItems, period);
+    const previous = previousPeriod ? aggregateProfitValues(branchItems, previousPeriod) : null;
+    const grossMargin = ratio(current.grossProfit, current.salesAmount);
+    const adjustedMargin = ratio(current.adjustedProfit, current.salesAmount);
+    const previousMargin = previous ? ratio(previous.adjustedProfit, previous.salesAmount) : 0;
+    return {
+      branch,
+      ...current,
+      grossMargin,
+      adjustedMargin,
+      previousMargin,
+      marginDelta: previous && previous.salesAmount > 0 ? adjustedMargin - previousMargin : null,
+      lossImpact: ratio(current.lossAmount, current.salesAmount),
+      projectedProfit: projectedAdjustedProfit(current, period),
+    };
+  }).sort((a, b) => (a.marginDelta ?? 0) - (b.marginDelta ?? 0) || a.adjustedMargin - b.adjustedMargin);
+}
+
+function renderBranchMarginChart(rows, period, previousPeriod, targetMargin) {
+  const branchRows = buildBranchProfitRows(rows, period, previousPeriod);
+  const maximum = Math.max(0.01, targetMargin, ...branchRows.flatMap((row) => [Math.abs(row.adjustedMargin), Math.abs(row.previousMargin)]));
+  const targetPosition = Math.min(100, targetMargin / maximum * 100);
+  $("branchMarginChartTitle").textContent = `지점 마진 비교 · ${formatPeriodLabel(period)}`;
+  $("branchMarginChart").innerHTML = branchRows.map((row) => {
+    const status = marginStatus(row);
+    const currentWidth = Math.min(100, Math.abs(row.adjustedMargin) / maximum * 100);
+    const previousWidth = Math.min(100, Math.abs(row.previousMargin) / maximum * 100);
+    return `
+      <div class="branch-margin-row">
+        <div class="branch-margin-name">
+          <strong>${escapeHtml(row.branch)}</strong>
+          <span class="margin-status ${escapeHtml(status.tone)}">${escapeHtml(status.label)}</span>
+        </div>
+        <div class="branch-margin-bars">
+          <div class="branch-margin-track previous"><i style="width:${previousWidth.toFixed(1)}%"></i><b style="left:${targetPosition.toFixed(1)}%"></b><span>전월 ${previousPeriod ? percentText(row.previousMargin) : "-"}</span></div>
+          <div class="branch-margin-track current ${row.adjustedMargin < 0 ? "negative" : ""}"><i style="width:${currentWidth.toFixed(1)}%"></i><b style="left:${targetPosition.toFixed(1)}%"></b><span>현재 ${percentText(row.adjustedMargin)}</span></div>
+        </div>
+        <strong class="branch-margin-delta ${row.marginDelta < 0 ? "negative" : row.marginDelta > 0 ? "positive" : ""}">${row.marginDelta === null ? "-" : signedPointText(row.marginDelta)}</strong>
+      </div>
+    `;
+  }).join("") || '<div class="empty">표시할 지점 데이터가 없습니다.</div>';
+}
+
+function renderCategoryMargins(rows, period, previousPeriod) {
+  const categories = Array.from(new Set(rows.map((row) => row.category))).sort((a, b) => a.localeCompare(b, "ko"));
+  const total = aggregateProfitValues(rows, period);
+  const totalProjectedProfit = projectedAdjustedProfit(total, period);
+  const categoryRows = categories.map((category) => {
+    const items = rows.filter((row) => row.category === category);
+    const current = aggregateProfitValues(items, period);
+    const previous = previousPeriod ? aggregateProfitValues(items, previousPeriod) : null;
+    const adjustedMargin = ratio(current.adjustedProfit, current.salesAmount);
+    const previousMargin = previous ? ratio(previous.adjustedProfit, previous.salesAmount) : 0;
+    return {
+      category,
+      ...current,
+      salesShare: ratio(current.salesAmount, total.salesAmount),
+      grossMargin: ratio(current.grossProfit, current.salesAmount),
+      adjustedMargin,
+      marginDelta: previous && previous.salesAmount > 0 && current.salesAmount > 0 ? adjustedMargin - previousMargin : null,
+      profitContribution: ratio(projectedAdjustedProfit(current, period), totalProjectedProfit),
+    };
+  }).sort((a, b) => b.salesShare - a.salesShare);
+  $("categoryMarginTitle").textContent = `카테고리 수익 구조 · ${formatPeriodLabel(period)}`;
+  $("categoryMarginBody").innerHTML = categoryRows.map((row) => `
+    <tr class="${row.adjustedMargin < 0.2 ? "profit-negative-row" : ""}">
+      <td><strong>${escapeHtml(row.category || "미분류")}</strong></td>
+      <td class="number">${percentText(row.salesShare)}</td>
+      <td class="number">${percentText(row.grossMargin)}</td>
+      <td class="number profit-value ${row.adjustedMargin < 0.2 ? "negative" : ""}">${percentText(row.adjustedMargin)}</td>
+      <td class="number margin-delta ${row.marginDelta < 0 ? "negative" : row.marginDelta > 0 ? "positive" : ""}">${row.marginDelta === null ? "-" : signedPointText(row.marginDelta)}</td>
+      <td class="number">${percentText(row.profitContribution)}</td>
+    </tr>
+  `).join("") || emptyRow(6);
+}
+
+function renderMarginActions(rows, period, targetMargin) {
+  const projectionFactor = profitProjectionFactor(period);
+  const actions = rows.map((row) => {
+    const projectedSales = row.profitSalesAmount * projectionFactor;
+    const projectedGrossProfit = row.profitGrossProfit * projectionFactor;
+    const projectedProfit = projectedGrossProfit - row.profitLossAmount;
+    const grossMargin = ratio(projectedGrossProfit, projectedSales);
+    const adjustedMargin = ratio(projectedProfit, projectedSales);
+    const targetGap = Math.max(0, projectedSales * targetMargin - projectedProfit);
+    const lossImpact = ratio(row.profitLossAmount, projectedSales);
+    const invalidPrice = (projectedSales > 0 || row.previousSalesAmount > 0) && (!(Number(row.price) > 0) || !(Number(row.salePrice) > 0));
+    let cause = "";
+    let recommendation = "";
+    if (invalidPrice) {
+      cause = "단가 데이터";
+      recommendation = "구매·판매단가 확인";
+    } else if (projectedSales <= 0 && row.profitLossAmount > 0) {
+      cause = "손실";
+      recommendation = "판매 없는 폐기·기타 발생 사유 확인";
+    } else if (grossMargin < targetMargin && lossImpact > 0) {
+      cause = "가격·원가 + 손실";
+      recommendation = "가격·매입가와 손실 원인 함께 확인";
+    } else if (grossMargin < targetMargin) {
+      cause = "가격·원가";
+      const requiredPrice = row.profitSalesQty > 0 ? (Number(row.price) + row.profitLossAmount / row.profitSalesQty) / Math.max(0.01, 1 - targetMargin) : 0;
+      recommendation = requiredPrice > 0 ? `가격·매입가 검토 (${cf.format(requiredPrice)} 기준)` : "가격·매입가 검토";
+    } else if (adjustedMargin < targetMargin || lossImpact > 0.03) {
+      cause = "손실";
+      recommendation = "폐기·기타 발생 사유 확인";
+    }
+    return { ...row, projectedSales, projectedProfit, grossMargin, adjustedMargin, targetGap, lossImpact, cause, recommendation };
+  }).filter((row) => row.targetGap > 0 || row.cause === "단가 데이터")
+    .sort((a, b) => b.targetGap - a.targetGap || b.lossImpact - a.lossImpact)
+    .slice(0, 25);
+
+  $("marginActionTitle").textContent = `마진 개선 우선순위 · ${formatPeriodLabel(period)}`;
+  $("marginActionBasis").textContent = `목표 ${percentText(targetMargin)}까지 부족한 예상 이익이 큰 순서입니다. 당월 손실은 현재까지 확정 금액만 반영합니다.`;
+  $("marginActionCount").textContent = `${nf.format(actions.length)}개`;
+  $("marginActionBody").innerHTML = actions.map((row, index) => `
+    <tr class="${index < 3 ? "margin-priority-high" : ""}">
+      <td><span class="margin-priority-index">${index + 1}</span></td>
+      <td><strong>${escapeHtml(row.branch)}</strong><small>${escapeHtml(row.category)}</small></td>
+      <td><strong>${escapeHtml(row.spec)}</strong><small>${escapeHtml(row.code)}</small></td>
+      <td class="number ${row.adjustedMargin < 0 ? "negative" : ""}">${percentText(row.adjustedMargin)}</td>
+      <td class="number negative"><strong>${cf.format(row.targetGap)}</strong></td>
+      <td class="number">${cf.format(row.profitLossAmount)}</td>
+      <td><span class="margin-cause ${row.cause === "손실" ? "loss" : row.cause === "단가 데이터" ? "data" : "price"}">${escapeHtml(row.cause)}</span></td>
+      <td>${escapeHtml(row.recommendation)}</td>
+    </tr>
+  `).join("") || emptyRow(8);
+}
+
+function renderProfitBranches(rows, period, previousPeriod) {
+  const branchRows = buildBranchProfitRows(rows, period, previousPeriod);
+  const periodLabel = formatPeriodLabel(period);
+  $("profitBranchTitle").textContent = `지점별 마진 변화 · ${periodLabel}`;
+  $("profitBranchBody").innerHTML = branchRows.map((row) => {
+    const status = marginStatus(row);
+    return `
+      <tr class="${status.tone === "danger" ? "profit-negative-row" : ""}">
+        <td><strong>${escapeHtml(row.branch)}</strong></td>
+        <td class="number">${percentText(row.grossMargin)}</td>
+        <td class="number profit-value ${row.adjustedMargin < 0.2 ? "negative" : ""}">${percentText(row.adjustedMargin)}</td>
+        <td class="number">${previousPeriod ? percentText(row.previousMargin) : "-"}</td>
+        <td class="number margin-delta ${row.marginDelta < 0 ? "negative" : row.marginDelta > 0 ? "positive" : ""}">${row.marginDelta === null ? "-" : signedPointText(row.marginDelta)}</td>
+        <td class="number">-${df.format(row.lossImpact * 100)}%p</td>
+        <td class="number">${cf.format(row.adjustedProfit)}</td>
+        <td class="number">${cf.format(row.projectedProfit)}</td>
+        <td><span class="margin-status ${escapeHtml(status.tone)}">${escapeHtml(status.label)}</span></td>
+      </tr>
+    `;
+  }).join("") || emptyRow(9);
+}
+
+function marginStatus(row) {
+  if (row.adjustedProfit < 0 || row.adjustedMargin < 0) return { label: "적자", tone: "danger" };
+  if (row.marginDelta !== null && row.marginDelta <= -0.03) return { label: "하락", tone: "danger" };
+  if (row.lossImpact >= 0.1) return { label: "손실 과다", tone: "warning" };
+  if (row.adjustedMargin < 0.2) return { label: "저마진", tone: "warning" };
+  if (row.marginDelta !== null && row.marginDelta >= 0.02) return { label: "개선", tone: "positive" };
+  return { label: "유지", tone: "normal" };
+}
+
+function renderProfitItems(rows, periodLabel) {
+  const profitDeclines = [...rows]
+    .filter((row) => row.profitChange !== null && row.profitChange < 0)
+    .sort((a, b) => a.profitChange - b.profitChange || a.profitAdjustedMargin - b.profitAdjustedMargin)
+    .slice(0, 10);
+  const lowMargin = [...rows]
+    .filter((row) => row.profitSalesAmount > 0 && (row.profitAdjustedMargin < 0.2 || row.profitAdjustedProfit <= 0))
+    .sort((a, b) => a.profitAdjustedMargin - b.profitAdjustedMargin || a.profitAdjustedProfit - b.profitAdjustedProfit);
+
+  $("marginDropTitle").textContent = `이익 감소 원인 품목 · ${periodLabel}`;
+  $("lowMarginTitle").textContent = `저마진·적자 품목 · ${periodLabel}`;
+  renderMarginItemList("marginDropList", "marginDropCount", profitDeclines, "전월 대비 예상 이익이 감소한 품목이 없습니다.", "decline");
+  renderMarginItemList("lowMarginList", "lowMarginCount", lowMargin, "손실 반영 마진율 20% 미만 또는 적자 품목이 없습니다.", "low");
+}
+
+function renderMarginItemList(targetId, countId, rows, emptyText, tone) {
+  $(countId).textContent = `${nf.format(rows.length)}개`;
+  const maximum = Math.max(0.01, ...rows.map((row) => Math.abs(tone === "decline" ? row.profitChange : row.profitAdjustedMargin)));
+  $(targetId).innerHTML = rows.map((row, index) => {
+    const metric = tone === "decline" ? row.profitChange : row.profitAdjustedMargin;
+    const width = Math.max(4, Math.abs(metric) / maximum * 100);
+    return `
+      <div class="dashboard-rank-row profit-rank low" style="--rank-width:${width.toFixed(1)}%">
+        <span class="dashboard-rank-bar"></span>
+        <span class="rank-index">${index + 1}</span>
+        <div class="rank-main">
+          <strong>${escapeHtml(row.category + " / " + row.branch)}</strong>
+          <span>${escapeHtml(row.code + " / " + row.spec)} · 예상 이익 ${cf.format(row.comparableAdjustedProfit)} · 전월 ${cf.format(row.previousAdjustedProfit)}</span>
+        </div>
+        <strong class="number dashboard-rank-value negative">${tone === "decline" ? cf.format(row.profitChange) : percentText(row.profitAdjustedMargin)}</strong>
+      </div>
+    `;
+  }).join("") || `<div class="empty">${escapeHtml(emptyText)}</div>`;
+}
+
+function vendingCurrentPeriod() {
+  return String(state.dataAsOf?.vending || state.generatedAt || "").slice(0, 7);
+}
+
+function vendingDashboardPeriods(rows) {
+  const periods = new Set(state.history.vendingMonths || []);
+  rows.forEach((row) => (row.monthlyHistory || []).forEach((month) => month.period && periods.add(month.period)));
+  const currentPeriod = vendingCurrentPeriod();
+  if (currentPeriod) periods.add(currentPeriod);
+  return [...periods].sort();
+}
+
+function dashboardPeriodValues(row, period) {
+  if (period === vendingCurrentPeriod()) {
+    const salesQty = Number(row.monthlyConsume) || 0;
+    const salesAmount = Number(row.salesAmount) || 0;
+    const lossAmount = (Number(row.discardAmount) || 0) + vendingOtherAmount(row);
+    const salesCost = Number(row.consumeAmount) || salesQty * (Number(row.price) || 0);
+    return {
+      salesQty,
+      salesAmount,
+      lossQty: (Number(row.monthlyDiscard) || 0) + (Number(row.monthlyOther) || 0),
+      lossAmount,
+      salesCost,
+      grossProfit: salesAmount - salesCost,
+      adjustedProfit: salesAmount - salesCost - lossAmount,
+    };
+  }
+  const month = (row.monthlyHistory || []).find((item) => item.period === period) || {};
+  const discardDetailsAmount = (month.discardDetails || []).reduce((total, item) => total + (Number(item.amount) || 0), 0);
+  const otherDetailsAmount = (month.otherDetails || []).reduce((total, item) => total + (Number(item.amount) || 0), 0);
+  const discardAmount = discardDetailsAmount || (Number(month.discard) || 0) * (Number(row.price) || 0);
+  const otherAmount = otherDetailsAmount || (Number(month.other) || 0) * (Number(row.price) || 0);
+  const salesQty = Number(month.consume) || 0;
+  const salesAmount = Number(month.salesAmount) || 0;
+  const salesCost = Number(month.amount) || salesQty * (Number(row.price) || 0);
+  const lossAmount = discardAmount + otherAmount;
+  return {
+    salesQty,
+    salesAmount,
+    lossQty: (Number(month.discard) || 0) + (Number(month.other) || 0),
+    lossAmount,
+    salesCost,
+    grossProfit: salesAmount - salesCost,
+    adjustedProfit: salesAmount - salesCost - lossAmount,
+  };
+}
+
+function dashboardRowsForSelection(rows, period, branch) {
+  return rows
+    .filter((row) => !branch || row.branch === branch)
+    .map((row) => {
+      const values = dashboardPeriodValues(row, period);
+      return {
+        ...row,
+        dashboardSalesQty: values.salesQty,
+        dashboardSalesAmount: values.salesAmount,
+        dashboardLossQty: values.lossQty,
+        dashboardLossAmount: values.lossAmount,
+      };
+    });
+}
+
+function renderDashboardBranchTrend(rows, periods) {
+  const branches = visibleVendingBranches(rows);
+  const colors = ["#147d70", "#2f6fbd", "#d17824", "#8b5bb5", "#c44848", "#65852f"];
+  const metric = state.dashboardMetric === "profit" ? "profit" : "sales";
+  const metricLabel = metric === "profit" ? "총 이익" : "매출";
+  const metricValue = (row, period) => {
+    const values = dashboardPeriodValues(row, period);
+    return metric === "profit" ? values.adjustedProfit : values.salesAmount;
+  };
+  const values = new Map();
+  branches.forEach((branch) => periods.forEach((period) => {
+    const value = rows
+      .filter((row) => row.branch === branch)
+      .reduce((total, row) => total + metricValue(row, period), 0);
+    values.set(`${branch}__${period}`, value);
+  }));
+  const rawValues = [...values.values()];
+  const minimum = metric === "profit" ? Math.min(0, ...rawValues) : 0;
+  const maximum = Math.max(1, ...rawValues);
+  const range = Math.max(1, maximum - minimum);
+  const width = Math.max(920, 90 + periods.length * 76);
+  const height = 310;
+  const pad = { top: 26, right: 28, bottom: 58, left: 76 };
+  const plotWidth = width - pad.left - pad.right;
+  const plotHeight = height - pad.top - pad.bottom;
+  const xFor = (index) => pad.left + (periods.length === 1 ? plotWidth / 2 : plotWidth * index / (periods.length - 1));
+  const yFor = (value) => pad.top + plotHeight - (value - minimum) / range * plotHeight;
+  const selected = state.dashboardSelection;
+  $("dashboardTrendTitle").textContent = `지점별 월 ${metricLabel} 추이`;
+  document.querySelectorAll("[data-dashboard-metric]").forEach((button) => {
+    button.classList.toggle("active", button.getAttribute("data-dashboard-metric") === metric);
+  });
+  $("dashboardTrendBasis").textContent = selected.branch
+    ? `${selected.branch} 선택 · ${metricLabel} 기준 · 그래프에서 월을 누르세요 · 현재 ${formatPeriodLabel(selected.period)}`
+    : `범례에서 지점을 선택하세요 · ${metricLabel} 기준 · 현재 전체 지점 ${formatPeriodLabel(selected.period)}`;
+  $("dashboardBranchTrendChart").innerHTML = periods.length ? `
+    <div class="dashboard-chart-scroll">
+      <svg class="dashboard-trend-svg" viewBox="0 0 ${width} ${height}" style="min-width:${width}px" role="img" aria-label="지점별 월 ${escapeHtml(metricLabel)} 추이">
+        <line class="chart-axis" x1="${pad.left}" y1="${pad.top + plotHeight}" x2="${width - pad.right}" y2="${pad.top + plotHeight}"></line>
+        <line class="chart-axis" x1="${pad.left}" y1="${pad.top}" x2="${pad.left}" y2="${pad.top + plotHeight}"></line>
+        <text class="chart-y-label" x="${pad.left - 10}" y="${pad.top + 4}">${escapeHtml(cf.format(maximum))}</text>
+        <text class="chart-y-label" x="${pad.left - 10}" y="${pad.top + plotHeight + 4}">${escapeHtml(cf.format(minimum))}</text>
+        ${branches.map((branch, branchIndex) => {
+          const color = colors[branchIndex % colors.length];
+          const branchActive = selected.branch === branch;
+          const points = periods.map((period, index) => ({ period, value: values.get(`${branch}__${period}`) || 0, x: xFor(index), y: yFor(values.get(`${branch}__${period}`) || 0) }));
+          const path = points.map((point, index) => `${index ? "L" : "M"} ${point.x.toFixed(1)} ${point.y.toFixed(1)}`).join(" ");
+          return `
+            <path class="dashboard-branch-line ${branchActive ? "selected" : selected.branch ? "muted" : ""}" d="${path}" style="stroke:${color}"></path>
+            ${points.map((point) => {
+              const active = selected.period === point.period && selected.branch === branch;
+              return `
+                <g class="dashboard-branch-point ${branchActive ? "selected" : selected.branch ? "muted" : ""} ${active ? "active" : ""}">
+                  <circle class="dashboard-point-dot" cx="${point.x}" cy="${point.y}" r="${active ? 7 : branchActive ? 5.5 : 4}" style="fill:${color};stroke:${active ? "#17242a" : "#fff"}"></circle>
+                  <title>${escapeHtml(`${branch} · ${formatPeriodLabel(point.period)} · ${metricLabel} ${cf.format(point.value)}`)}</title>
+                </g>
+              `;
+            }).join("")}
+          `;
+        }).join("")}
+        ${periods.map((period, index) => {
+          const left = index === 0 ? pad.left : (xFor(index - 1) + xFor(index)) / 2;
+          const right = index === periods.length - 1 ? width - pad.right : (xFor(index) + xFor(index + 1)) / 2;
+          return `<rect class="dashboard-month-hit ${selected.period === period ? "active" : ""}" x="${left}" y="${pad.top}" width="${right - left}" height="${plotHeight}" data-dashboard-select-period="${escapeHtml(period)}"><title>${escapeHtml(formatPeriodLabel(period))} 선택</title></rect>`;
+        }).join("")}
+        ${periods.map((period, index) => `<text class="chart-x-label" x="${xFor(index)}" y="${height - 18}">${escapeHtml(formatPeriodShort(period))}</text>`).join("")}
+      </svg>
+    </div>
+    <div class="dashboard-chart-legend">
+      <button type="button" class="dashboard-legend-button ${selected.branch ? "" : "active"}" data-dashboard-select-branch="">전체 지점</button>
+      ${branches.map((branch, index) => `<button type="button" class="dashboard-legend-button ${selected.branch === branch ? "active" : ""}" data-dashboard-select-branch="${escapeHtml(branch)}"><i style="background:${colors[index % colors.length]}"></i>${escapeHtml(branch)}</button>`).join("")}
+    </div>
+  ` : `<div class="empty">표시할 ${escapeHtml(metricLabel)} 이력이 없습니다.</div>`;
+}
+
+function visibleVendingBranches(rows) {
+  const selectedBranch = $("branchFilter")?.value || "전체";
+  if (selectedBranch !== "전체") return [selectedBranch];
+  return Array.from(new Set([
+    ...effectiveBranchesForDataset("vending").filter((branch) => branch !== "전체"),
+    ...rows.map((row) => row.branch),
+  ])).sort((a, b) => a.localeCompare(b, "ko"));
 }
 
 function dashboardCard(label, value, tone = "") {
@@ -2121,10 +2997,14 @@ function dashboardCard(label, value, tone = "") {
 function groupVendingDashboardByBranch(rows) {
   const map = new Map();
   rows.forEach((row) => {
-    const target = map.get(row.branch) || { branch: row.branch, salesAmount: 0, discardAmount: 0, otherAmount: 0 };
+    const target = map.get(row.branch) || { branch: row.branch, salesAmount: 0, salesQty: 0, grossProfit: 0, discardAmount: 0, otherAmount: 0, deliveryQty: 0, stock: 0 };
     target.salesAmount += row.salesAmount || 0;
+    target.salesQty += row.monthlyConsume || 0;
+    target.grossProfit += (row.salesAmount || 0) - ((Number(row.monthlyConsume) || 0) * (Number(row.price) || 0));
     target.discardAmount += row.discardAmount || 0;
     target.otherAmount += vendingOtherAmount(row);
+    target.deliveryQty += row.deliveryQty || 0;
+    target.stock += row.stock || 0;
     map.set(row.branch, target);
   });
   return map;
@@ -2134,14 +3014,83 @@ function vendingOtherAmount(row) {
   return (Number(row.monthlyOther) || 0) * (Number(row.price) || 0);
 }
 
-function renderDashboardTop(targetId, rows, valueKey, qtyFor, emptyText) {
-  const ranked = [...rows]
+function percentText(value) {
+  return `${df.format((Number(value) || 0) * 100)}%`;
+}
+
+function averageVendingBranchSales(rows, analysisPeriods, branch) {
+  if (!analysisPeriods.length) return 0;
+  const periodSet = new Set(analysisPeriods);
+  const total = rows
+    .filter((row) => row.branch === branch)
+    .reduce((branchTotal, row) => branchTotal + (row.monthlyHistory || [])
+      .filter((month) => periodSet.has(month.period))
+      .reduce((rowTotal, month) => rowTotal + (Number(month.salesAmount) || 0), 0), 0);
+  return total / analysisPeriods.length;
+}
+
+function vendingProjectionBasis() {
+  const sourceDate = state.dataAsOf?.vending || String(state.generatedAt || "").slice(0, 10);
+  const [year, month, day] = sourceDate.split("-").map(Number);
+  if (!year || !month || !day) return null;
+  const daysInMonth = new Date(year, month, 0).getDate();
+  return {
+    sourceDate,
+    elapsedDays: Math.min(day, daysInMonth),
+    daysInMonth,
+  };
+}
+
+function dashboardBranchFlags(row) {
+  const flags = [];
+  if (row.lossRate >= 0.1) flags.push("손실 확인");
+  const basis = vendingProjectionBasis();
+  if (!basis || basis.elapsedDays <= 7 || row.averageSalesAmount <= 0) {
+    flags.push("판단 보류");
+  } else {
+    const projectedSalesAmount = row.salesAmount / basis.elapsedDays * basis.daysInMonth;
+    if (projectedSalesAmount >= row.averageSalesAmount * 1.5) flags.push("판매 좋음");
+    else if (projectedSalesAmount <= row.averageSalesAmount * 0.7) flags.push("판매 속도 저조");
+  }
+  return flags.length ? flags : ["정상"];
+}
+
+function dashboardFlag(label) {
+  return `<span class="dashboard-flag ${dashboardFlagClass(label)}">${escapeHtml(label)}</span>`;
+}
+
+function dashboardFlagClass(label) {
+  if (label === "정상") return "flag-normal";
+  if (label === "배송 필요") return "flag-delivery";
+  if (label === "판매 좋음") return "flag-good";
+  if (label === "손실 확인") return "flag-loss";
+  if (label === "판매 속도 저조") return "flag-slow";
+  if (label === "판단 보류") return "flag-pending";
+  if (label === "판매 제외 확인") return "flag-excluded";
+  return "";
+}
+
+function renderDashboardTop(targetId, countId, rows, valueKey, qtyFor, emptyText, tone, limit = null) {
+  const rankedRows = [...rows]
     .filter((row) => (Number(row[valueKey]) || 0) > 0)
-    .sort((a, b) => (Number(b[valueKey]) || 0) - (Number(a[valueKey]) || 0) || a.code.localeCompare(b.code, "ko"))
-    .slice(0, 10);
+    .sort((a, b) => (Number(b[valueKey]) || 0) - (Number(a[valueKey]) || 0) || a.code.localeCompare(b.code, "ko"));
+  const ranked = limit === null ? rankedRows : rankedRows.slice(0, limit);
+  $(countId).textContent = `${nf.format(ranked.length)}개`;
+  const maximum = Number(ranked[0]?.[valueKey]) || 1;
   $(targetId).innerHTML = ranked.map((row, index) => {
     const qty = qtyText(row, qtyFor(row));
-    return rankRow(index, row.category + " / " + row.branch, row.code + " / " + row.spec + " / " + qty, cf.format(row[valueKey]));
+    const width = Math.max(4, (Number(row[valueKey]) || 0) / maximum * 100);
+    return `
+      <div class="dashboard-rank-row ${escapeHtml(tone)}" style="--rank-width:${width.toFixed(1)}%">
+        <span class="dashboard-rank-bar"></span>
+        <span class="rank-index">${index + 1}</span>
+        <div class="rank-main">
+          <strong>${escapeHtml(row.category + " / " + row.branch)}</strong>
+          <span>${escapeHtml(row.code + " / " + row.spec + " / " + qty)}</span>
+        </div>
+        <strong class="number dashboard-rank-value">${escapeHtml(cf.format(row[valueKey]))}</strong>
+      </div>
+    `;
   }).join("") || '<div class="empty">' + escapeHtml(emptyText) + '</div>';
 }
 
